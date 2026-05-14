@@ -1,5 +1,350 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { analyzeText, analyzeAPK, analyzeHAR, streamAI, checkHealth } from './api.js'
+import { analyzeText, analyzeAPK, analyzeHAR, decompileFull, checkDecompileTools, streamAI, checkHealth } from './api.js'
+
+// ── Conversion des résultats backend java_security_checks → format checklist ──
+//
+// Le backend retourne un tableau de checks avec { label, found, detail, severity, vulnerable }
+// On mappe vers le format attendu par ChecklistItem { key, label, detail, severity, icon,
+// analyzed, ok, found, verdict }
+//
+const BACKEND_CHECK_MAP = {
+  'TrustManager custom':        { key: 'trust_manager',    icon: 'certificate',  severity: 'critical' },
+  'HostnameVerifier custom':    { key: 'hostname_verifier', icon: 'server',       severity: 'critical' },
+  'WebView onReceivedSslError': { key: 'webview_ssl',      icon: 'world',        severity: 'critical' },
+  'OkHttp CertificatePinner':   { key: 'cert_pinning',     icon: 'fingerprint',  severity: 'high'     },
+  'TLS 1.2 minimum':            { key: 'tls_version',      icon: 'lock',         severity: 'medium'   },
+  'Cipher suite moderne':       { key: 'cipher_suite',     icon: 'shield-lock',  severity: 'medium'   },
+  'Cleartext traffic autorisé': { key: 'cleartext',        icon: 'lock-open',    severity: 'critical' },
+}
+
+function buildChecklistFromBackend(backendChecks, results) {
+  // Checks basés sur le code Java (depuis backend)
+  const javaChecks = backendChecks.map(bc => {
+    const meta = BACKEND_CHECK_MAP[bc.label] || {
+      key: bc.label.toLowerCase().replace(/\s+/g, '_'),
+      icon: 'shield',
+      severity: bc.severity || 'medium',
+    }
+    const ok = !bc.vulnerable
+    return {
+      key: meta.key,
+      label: bc.label,
+      detail: bc.detail,
+      severity: meta.severity,
+      icon: meta.icon,
+      analyzed: true,
+      ok,
+      found: bc.found ? String(bc.found).slice(0, 120) : null,
+      verdict: bc.detail,
+    }
+  })
+
+  // Checks NSC/Cleartext (toujours depuis le XML, pas du Java)
+  const hasNsc = !!results?.nsc_xml
+  const rawStrings = results?.raw_strings || ''
+  const cleartextAllowed = !!(
+    rawStrings.match(/cleartextTrafficPermitted\s*=\s*["']true["']/) ||
+    rawStrings.match(/android:usesCleartextTraffic\s*=\s*["']true["']/)
+  )
+  const debugOverride = !!(rawStrings.match(/<debug-overrides>[\s\S]{0,200}<certificates\s+src\s*=\s*["']user["']/))
+
+  // Si cleartext ou debug_override déjà couverts par backendChecks, ne pas dupliquer
+  const hasCleartext = javaChecks.some(c => c.key === 'cleartext')
+  if (!hasCleartext) {
+    javaChecks.push({
+      key: 'cleartext',
+      label: 'Cleartext traffic interdit',
+      detail: 'cleartextTrafficPermitted=false dans NSC/Manifest',
+      severity: 'critical',
+      icon: 'lock-open',
+      analyzed: !!(hasNsc || rawStrings),
+      ok: !cleartextAllowed,
+      found: cleartextAllowed ? 'cleartextTrafficPermitted=true' : null,
+      verdict: cleartextAllowed
+        ? 'VULNÉRABLE — cleartextTrafficPermitted=true ou usesCleartextTraffic=true détecté'
+        : hasNsc ? 'OK — Cleartext non autorisé dans le NSC' : 'NSC non fourni — vérification impossible',
+    })
+  }
+
+  javaChecks.push({
+    key: 'debug_override',
+    label: 'Debug overrides en prod',
+    detail: 'Certificats user ou CA custom actifs en debug uniquement',
+    severity: 'high',
+    icon: 'bug',
+    analyzed: hasNsc,
+    ok: !debugOverride,
+    found: debugOverride ? '<debug-overrides> avec src=user' : null,
+    verdict: debugOverride
+      ? 'ATTENTION — debug-overrides avec certificats user détecté'
+      : hasNsc ? 'OK — Aucun debug-override avec CA user détecté' : 'NSC non fourni — vérification impossible',
+  })
+
+  const checks = javaChecks
+  const hasAnalysis = true
+  const hasCode = true
+  const critical = checks.filter(c => c.ok === false && c.severity === 'critical').length
+  const high = checks.filter(c => c.ok === false && c.severity === 'high').length
+  const passed = checks.filter(c => c.ok === true).length
+
+  return { checks, hasAnalysis, hasCode, critical, high, passed }
+}
+
+// ── Analyse dynamique de la checklist Android ─────────────────────────────────
+//
+// Priorité 1 : java_security_checks retourné par le backend (analyse complète
+//              sur le code Java non tronqué via /decompile/full)
+// Priorité 2 : analyse locale JS sur les fichiers java_files (fallback, tronqués
+//              à 3000 chars par fichier — moins fiable)
+//
+function analyzeAndroidChecklist(results) {
+  // ── Priorité 1 : résultats backend (code Java complet, non tronqué) ─────────
+  const backendChecks = results?.java_security_checks
+  if (backendChecks && backendChecks.length > 0) {
+    return buildChecklistFromBackend(backendChecks, results)
+  }
+
+  // ── Priorité 2 : analyse locale JS (fallback — fichiers tronqués à 3000 chars) ─
+  const javaFiles = results?.java?.java_files || []
+  const smaliFiles = results?.smali?.smali_files || []
+  const rawStrings = results?.raw_strings || ''
+  const javaCode = [
+    ...javaFiles.map(f => f.content || ''),
+    ...smaliFiles.map(f => f.content || ''),
+    rawStrings,
+  ].join('\n')
+
+  const hasCode = javaCode.trim().length > 50
+
+  // Cherche un pattern dans le code, retourne l'extrait trouvé ou null
+  function search(patterns) {
+    for (const p of patterns) {
+      const m = javaCode.match(p)
+      if (m) return m[0].slice(0, 120).trim()
+    }
+    return null
+  }
+
+  // ── 1. TrustManager custom vide (checkServerTrusted vide = vulnérable) ──
+  const tmEmpty = search([
+    /checkServerTrusted\s*\([^)]*\)\s*\{[\s]*\}/,
+    /checkServerTrusted\s*\([^)]*\)\s*throws[^{]*\{[\s]*\}/,
+    /public void checkServerTrusted/,
+  ])
+  const tmFilled = search([
+    /checkServerTrusted[\s\S]{0,300}(throw|CertificateException|chain\.length|verify)/,
+  ])
+  const tmVuln = !!tmEmpty && !tmFilled
+  const tmPresent = !!tmEmpty || !!tmFilled
+
+  // ── 2. HostnameVerifier dangereux ──
+  const hnvVuln = search([
+    /AllowAllHostnameVerifier/,
+    /ALLOW_ALL_HOSTNAME_VERIFIER/,
+    /verify\s*\([^)]*\)\s*\{\s*return\s+true\s*;?\s*\}/,
+    /new\s+HostnameVerifier\s*\(\s*\)\s*\{[\s\S]{0,100}return\s+true/,
+  ])
+  const hnvPresent = search([/HostnameVerifier/, /hostnameVerifier/])
+
+  // ── 3. WebView onReceivedSslError ──
+  const wvProceed = search([
+    /onReceivedSslError[\s\S]{0,200}handler\.proceed\s*\(\s*\)/,
+    /handler\.proceed\(\)/,
+  ])
+  const wvPresent = search([/onReceivedSslError/, /SslErrorHandler/])
+
+  // ── 4. OkHttp CertificatePinner ──
+  const pinFound = search([
+    /CertificatePinner/,
+    /certificatePinner/,
+    /sha256\//,
+    /\.add\s*\(\s*["'][^"']+["']\s*,\s*["']sha256\//,
+  ])
+  const sha256Found = search([/sha256\/[A-Za-z0-9+/=]{20,}/, /pin\s*=\s*["']sha/])
+
+  // ── 5. Version TLS — SSLv3/TLS 1.0 désactivés ──
+  const tlsWeak = search([
+    /SSLv3/,
+    /TLSv1(?!\.2|\.3)/,
+    /TLS_1_0/,
+    /setEnabledProtocols[\s\S]{0,100}SSLv/,
+  ])
+  const tlsStrong = search([
+    /ConnectionSpec\.MODERN_TLS/,
+    /TLSv1\.2/,
+    /TLSv1\.3/,
+    /SSLContext\.getInstance\s*\(\s*["']TLSv1\.2/,
+    /SSLContext\.getInstance\s*\(\s*["']TLS/,
+  ])
+
+  // ── 6. Cipher suite moderne (OkHttp ConnectionSpec) ──
+  const modernTLS = search([
+    /ConnectionSpec\.MODERN_TLS/,
+    /MODERN_TLS/,
+    /CipherSuite\.(TLS_ECDHE|TLS_AES)/,
+  ])
+  const oldCipher = search([
+    /RC4|MD5|DES|NULL_WITH/,
+    /TLS_RSA_WITH_RC4/,
+    /SSL_RSA/,
+  ])
+
+  // ── 7. Cleartext traffic (NSC ou Manifest) ──
+  const cleartextAllowed = search([
+    /cleartextTrafficPermitted\s*=\s*["']true["']/,
+    /android:usesCleartextTraffic\s*=\s*["']true["']/,
+    /NetworkSecurityPolicy\.getInstance\(\)\.isCleartextTrafficPermitted/,
+  ])
+
+  // ── 8. Debug overrides (certificats user en prod) ──
+  const debugOverride = search([
+    /<debug-overrides>[\s\S]{0,200}<certificates\s+src\s*=\s*["']user["']/,
+    /certificates.*src.*user/,
+  ])
+
+  // Construire les résultats
+  const checks = [
+    {
+      key: 'trust_manager',
+      label: 'TrustManager custom',
+      detail: 'checkServerTrusted() — ne doit pas être vide',
+      severity: 'critical',
+      icon: 'certificate',
+      analyzed: hasCode && tmPresent,
+      ok: hasCode ? (tmPresent ? !tmVuln : true) : null,
+      found: tmEmpty || tmFilled || null,
+      verdict: hasCode
+        ? tmPresent
+          ? tmVuln
+            ? 'VULNÉRABLE — checkServerTrusted() vide détecté, validation SSL désactivée'
+            : 'OK — checkServerTrusted() implémenté avec validation'
+          : 'Non détecté dans le code analysé'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'hostname_verifier',
+      label: 'HostnameVerifier custom',
+      detail: 'AllowAllHostnameVerifier ou verify() → true interdit',
+      severity: 'critical',
+      icon: 'server',
+      analyzed: hasCode && !!hnvPresent,
+      ok: hasCode ? (hnvPresent ? !hnvVuln : true) : null,
+      found: hnvVuln || hnvPresent || null,
+      verdict: hasCode
+        ? hnvVuln
+          ? 'VULNÉRABLE — HostnameVerifier permissif détecté (AllowAll ou return true)'
+          : hnvPresent
+            ? 'OK — HostnameVerifier présent, aucun bypass détecté'
+            : 'Non détecté — vérification manuelle recommandée'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'webview_ssl',
+      label: 'WebView onReceivedSslError',
+      detail: 'Ne doit pas appeler handler.proceed()',
+      severity: 'critical',
+      icon: 'world',
+      analyzed: hasCode && !!wvPresent,
+      ok: hasCode ? (wvPresent ? !wvProceed : true) : null,
+      found: wvProceed || wvPresent || null,
+      verdict: hasCode
+        ? wvProceed
+          ? 'VULNÉRABLE — handler.proceed() dans onReceivedSslError, toutes les erreurs SSL acceptées'
+          : wvPresent
+            ? 'OK — onReceivedSslError présent sans appel à handler.proceed()'
+            : 'WebView non utilisé ou non détecté'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'cert_pinning',
+      label: 'OkHttp CertificatePinner',
+      detail: 'Pins SHA-256 configurés dans OkHttp',
+      severity: 'high',
+      icon: 'fingerprint',
+      analyzed: hasCode,
+      ok: hasCode ? !!pinFound : null,
+      found: pinFound || sha256Found || null,
+      verdict: hasCode
+        ? pinFound
+          ? sha256Found
+            ? 'OK — CertificatePinner configuré avec pins SHA-256'
+            : 'CertificatePinner détecté, vérifier les pins SHA-256'
+          : 'ABSENT — Certificate Pinning non configuré, MITM possible'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'tls_version',
+      label: 'TLS 1.2 minimum',
+      detail: 'SSLSocketFactory — SSLv3 et TLS 1.0 désactivés',
+      severity: 'medium',
+      icon: 'lock',
+      analyzed: hasCode,
+      ok: hasCode ? (!tlsWeak || !!tlsStrong) : null,
+      found: tlsWeak || tlsStrong || null,
+      verdict: hasCode
+        ? tlsWeak && !tlsStrong
+          ? 'RISQUE — Protocoles faibles (SSLv3/TLS 1.0) détectés sans configuration moderne'
+          : tlsStrong
+            ? 'OK — TLS moderne configuré (TLS 1.2/1.3 ou MODERN_TLS)'
+            : 'Non configuré explicitement — dépend des defaults Android (API 20+ = TLS 1.2 par défaut)'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'cipher_suite',
+      label: 'Cipher suite moderne',
+      detail: 'ConnectionSpec.MODERN_TLS dans OkHttp',
+      severity: 'medium',
+      icon: 'shield-lock',
+      analyzed: hasCode,
+      ok: hasCode ? (!!modernTLS || !oldCipher) : null,
+      found: modernTLS || oldCipher || null,
+      verdict: hasCode
+        ? oldCipher
+          ? 'RISQUE — Cipher faible détecté (RC4/DES/MD5)'
+          : modernTLS
+            ? 'OK — ConnectionSpec.MODERN_TLS configuré'
+            : 'Non configuré explicitement — utilise les defaults OkHttp/Android'
+        : 'Code Java non disponible (jadx requis)',
+    },
+    {
+      key: 'cleartext',
+      label: 'Cleartext traffic interdit',
+      detail: 'cleartextTrafficPermitted=false dans NSC/Manifest',
+      severity: 'critical',
+      icon: 'lock-open',
+      analyzed: !!(results?.nsc_xml || rawStrings),
+      ok: !cleartextAllowed,
+      found: cleartextAllowed || null,
+      verdict: cleartextAllowed
+        ? 'VULNÉRABLE — cleartextTrafficPermitted=true ou usesCleartextTraffic=true détecté'
+        : results?.nsc_xml
+          ? 'OK — Cleartext non autorisé dans le NSC'
+          : 'NSC non fourni — vérification impossible',
+    },
+    {
+      key: 'debug_override',
+      label: 'Debug overrides en prod',
+      detail: 'Certificats user ou CA custom actifs en debug uniquement',
+      severity: 'high',
+      icon: 'bug',
+      analyzed: !!(results?.nsc_xml),
+      ok: !debugOverride,
+      found: debugOverride || null,
+      verdict: debugOverride
+        ? 'ATTENTION — debug-overrides avec certificats user détecté (acceptable si build debug uniquement)'
+        : results?.nsc_xml
+          ? 'OK — Aucun debug-override avec CA user détecté'
+          : 'NSC non fourni — vérification impossible',
+    },
+  ]
+
+  const hasAnalysis = hasCode || !!results?.nsc_xml
+  const critical = checks.filter(c => c.ok === false && c.severity === 'critical').length
+  const high = checks.filter(c => c.ok === false && c.severity === 'high').length
+  const passed = checks.filter(c => c.ok === true).length
+
+  return { checks, hasAnalysis, hasCode, critical, high, passed }
+}
 
 // ── Small components ──────────────────────────────────────────────────────────
 
@@ -141,14 +486,79 @@ function DropZone({ onFile }) {
   )
 }
 
+// ── ChecklistItem — composant dynamique avec expand/collapse ─────────────────
+
+function ChecklistItem({ check: c, isLast }) {
+  const [open, setOpen] = useState(false)
+
+  // Icône d'état
+  let stateIcon, stateColor
+  if (c.ok === true)  { stateIcon = 'circle-check';    stateColor = 'var(--green)' }
+  if (c.ok === false) { stateIcon = 'circle-x';        stateColor = 'var(--red)' }
+  if (c.ok === null)  { stateIcon = 'circle-dashed';   stateColor = 'var(--text3)' }
+
+  return (
+    <div style={{ borderBottom: isLast ? 'none' : '1px solid var(--border)' }}>
+      <div
+        style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', cursor: c.found ? 'pointer' : 'default' }}
+        onClick={() => c.found && setOpen(o => !o)}
+      >
+        <i className={`ti ti-${stateIcon}`} style={{ fontSize: 16, color: stateColor, flexShrink: 0, marginTop: 1 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <i className={`ti ti-${c.icon}`} style={{ fontSize: 12, color: 'var(--text3)' }} />
+            {c.label}
+            {c.analyzed && c.ok !== null && (
+              <span style={{ fontSize: 9, color: 'var(--accent)', background: '#0c2340', padding: '1px 5px', borderRadius: 10, fontWeight: 500 }}>
+                ANALYSÉ
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: 12, color: c.ok === false ? '#f85149' : c.ok === true ? 'var(--green)' : 'var(--text2)', marginBottom: c.ok !== null ? 2 : 0 }}>
+            {c.verdict || c.detail}
+          </div>
+          {c.ok === null && (
+            <div style={{ fontSize: 11, color: 'var(--text3)' }}>{c.detail}</div>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          <Badge severity={c.ok === true ? 'low' : c.severity} />
+          {c.found && (
+            <i className={`ti ti-chevron-${open ? 'up' : 'down'}`} style={{ fontSize: 12, color: 'var(--text3)' }} />
+          )}
+        </div>
+      </div>
+
+      {/* Extrait de code trouvé */}
+      {open && c.found && (
+        <div style={{
+          margin: '0 0 10px 26px',
+          background: 'var(--bg)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)',
+          padding: '8px 12px',
+        }}>
+          <div style={{ fontSize: 10, color: 'var(--text3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Extrait détecté dans le code
+          </div>
+          <code style={{ fontSize: 11, color: c.ok === false ? '#f85149' : 'var(--orange)', wordBreak: 'break-all', display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+            {c.found}
+          </code>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 
 const TABS = [
-  { key: 'input',     label: 'Entrées',    icon: 'file-import' },
-  { key: 'endpoints', label: 'Endpoints',  icon: 'world' },
-  { key: 'tls',       label: 'Checks TLS', icon: 'lock' },
-  { key: 'anomalies', label: 'Anomalies',  icon: 'alert-triangle' },
-  { key: 'ai',        label: 'Rapport IA', icon: 'sparkles' },
+  { key: 'input',     label: 'Entrées',        icon: 'file-import' },
+  { key: 'endpoints', label: 'Endpoints',      icon: 'world' },
+  { key: 'tls',       label: 'Checks TLS',     icon: 'lock' },
+  { key: 'anomalies', label: 'Anomalies',      icon: 'alert-triangle' },
+  { key: 'decompile', label: 'Décompilation',  icon: 'code' },
+  { key: 'ai',        label: 'Rapport IA',     icon: 'sparkles' },
 ]
 
 const DEMO_APK = `https://api.prod.myapp.com/v2/users
@@ -276,6 +686,30 @@ export default function App() {
       setTab('endpoints')
     } catch (e) {
       alert('Erreur import HAR : ' + e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function runFullDecompilation() {
+    if (!apkFile) {
+      alert('Charge d\'abord un APK')
+      return
+    }
+    setLoading(true)
+    try {
+      const data = await decompileFull(apkFile)
+      // Fusionner les résultats de décompilation avec les résultats statiques
+      setResults({
+        ...results,
+        ...data,
+        java: data.java || results?.java,
+        smali: data.smali || results?.smali,
+        secrets: data.secrets_detected || data.secrets || []
+      })
+      setTab('decompile')
+    } catch (e) {
+      alert('Erreur décompilation : ' + e.message)
     } finally {
       setLoading(false)
     }
@@ -631,26 +1065,53 @@ Génère des recommandations concrètes et priorisées :
                     ))}
                   </Card>
 
-                  <Card>
-                    <SectionTitle icon="list-check">Checklist manuelle Android</SectionTitle>
-                    {[
-                      { label: 'TrustManager custom', detail: 'Vérifier checkServerTrusted() — ne doit pas être vide', severity: 'critical' },
-                      { label: 'HostnameVerifier custom', detail: 'Chercher AllowAllHostnameVerifier ou verify() → true', severity: 'critical' },
-                      { label: 'WebView onReceivedSslError', detail: 'Ne doit pas appeler handler.proceed()', severity: 'critical' },
-                      { label: 'OkHttp CertificatePinner', detail: 'Vérifier si configuré avec SHA-256 pins', severity: 'high' },
-                      { label: 'TLS 1.2 minimum', detail: 'OkHttp SSLSocketFactory — désactiver SSLv3, TLS 1.0', severity: 'medium' },
-                      { label: 'Cipher suite moderne', detail: 'Vérifier ConnectionSpec.MODERN_TLS dans OkHttp', severity: 'medium' },
-                    ].map((c, i) => (
-                      <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
-                        <i className="ti ti-checkbox" style={{ fontSize: 15, color: 'var(--text3)', flexShrink: 0, marginTop: 1 }} />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{c.label}</div>
-                          <div style={{ fontSize: 12, color: 'var(--text2)' }}>{c.detail}</div>
+                  {/* ── CHECKLIST DYNAMIQUE ── */}
+                  {(() => {
+                    const cl = analyzeAndroidChecklist(results)
+                    return (
+                      <Card>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+                          <i className="ti ti-list-check" style={{ fontSize: 15, color: 'var(--text2)' }} />
+                          <span style={{ fontSize: 13, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                            Checklist Android
+                          </span>
+                          <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, fontSize: 11 }}>
+                            {cl.critical > 0 && (
+                              <span style={{ background: '#3d1a1a', color: '#f85149', padding: '2px 8px', borderRadius: 20, fontWeight: 700 }}>
+                                {cl.critical} critique{cl.critical > 1 ? 's' : ''}
+                              </span>
+                            )}
+                            {cl.high > 0 && (
+                              <span style={{ background: '#2d1f0a', color: '#d29922', padding: '2px 8px', borderRadius: 20 }}>
+                                {cl.high} élevé{cl.high > 1 ? 's' : ''}
+                              </span>
+                            )}
+                            <span style={{ background: 'var(--bg3)', color: 'var(--text2)', padding: '2px 8px', borderRadius: 20 }}>
+                              {cl.passed}/{cl.checks.length} OK
+                            </span>
+                          </span>
                         </div>
-                        <Badge severity={c.severity} />
-                      </div>
-                    ))}
-                  </Card>
+
+                        {!cl.hasAnalysis && (
+                          <div style={{ fontSize: 12, color: 'var(--text2)', background: 'var(--bg3)', borderRadius: 'var(--radius)', padding: '10px 14px', marginBottom: 10, display: 'flex', gap: 8 }}>
+                            <i className="ti ti-info-circle" />
+                            Checklist statique — uploadez un APK et lancez la décompilation complète pour une analyse dynamique du code Java.
+                          </div>
+                        )}
+
+                        {cl.hasCode && (
+                          <div style={{ fontSize: 11, color: 'var(--green)', background: '#0d2310', borderRadius: 'var(--radius)', padding: '6px 12px', marginBottom: 12, display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <i className="ti ti-circle-check" />
+                            Analyse dynamique — code Java décompilé détecté, résultats basés sur le code réel de l'APK
+                          </div>
+                        )}
+
+                        {cl.checks.map((c, i) => (
+                          <ChecklistItem key={c.key} check={c} isLast={i === cl.checks.length - 1} />
+                        ))}
+                      </Card>
+                    )
+                  })()}
                 </>
               )}
             </div>
@@ -691,6 +1152,171 @@ Génère des recommandations concrètes et priorisées :
                       </div>
                     ))}
                   </Card>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── DÉCOMPILATION ── */}
+          {tab === 'decompile' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              {!apkFile ? (
+                <p style={{ color: 'var(--text2)', fontSize: 13 }}>
+                  📦 Charge d'abord un APK dans l'onglet <strong>Entrées</strong> pour accéder à la décompilation complète.
+                </p>
+              ) : (
+                <>
+                  {/* Tools Status */}
+                  <Card style={{ background: 'var(--bg3)', padding: '1rem' }}>
+                    <SectionTitle icon="info-circle">Statut des outils de décompilation</SectionTitle>
+                    <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
+                      Installez <strong>apktool</strong> et <strong>jadx</strong> pour la décompilation complète :
+                    </p>
+                    <div style={{ fontSize: 12, display: 'flex', gap: 20 }}>
+                      <div>
+                        <strong>Smali (apktool)</strong>
+                        <div style={{ color: 'var(--text2)', marginTop: 4 }}>
+                          <code style={{ fontSize: 11 }}>apt install apktool</code>
+                        </div>
+                      </div>
+                      <div>
+                        <strong>Java (jadx)</strong>
+                        <div style={{ color: 'var(--text2)', marginTop: 4 }}>
+                          <code style={{ fontSize: 11 }}>apt install jadx</code>
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
+
+                  {/* Decompilation Options */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+                    <Card>
+                      <SectionTitle icon="code">Code Java complet</SectionTitle>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
+                        Décompile en code source Java lisible
+                      </p>
+                      <button onClick={() => results?.java ? setTab('decompile') : alert('Lancer la décompilation d\'abord')}>
+                        <i className="ti ti-player-play" />
+                        Voir le code Java
+                      </button>
+                    </Card>
+
+                    <Card>
+                      <SectionTitle icon="code-plus">Assembleur Smali</SectionTitle>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
+                        Code assembleur optimisé (bytecode Dalvik)
+                      </p>
+                      <button onClick={() => results?.smali ? setTab('decompile') : alert('Lancer la décompilation d\'abord')}>
+                        <i className="ti ti-player-play" />
+                        Voir le Smali
+                      </button>
+                    </Card>
+
+                    <Card>
+                      <SectionTitle icon="rocket">Décompilation COMPLÈTE</SectionTitle>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
+                        Statique + Smali + Java + secrets
+                      </p>
+                      <button onClick={runFullDecompilation} disabled={loading} style={{ background: loading ? '#2d2d2d' : 'var(--accent)' }}>
+                        <i className={`ti ti-${loading ? 'loader' : 'rocket'}`} style={loading ? { animation: 'spin 1s linear infinite' } : {}} />
+                        {loading ? 'Décompilation…' : 'Décompiler'}
+                      </button>
+                    </Card>
+                  </div>
+
+                  {/* Results */}
+                  {results?.java && (
+                    <Card>
+                      <SectionTitle icon="file-code" count={results.java.java_files?.length || 0}>Fichiers Java décompilés</SectionTitle>
+                      {results.java.java_files?.length > 0 ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          {results.java.java_files.slice(0, 20).map((file, i) => (
+                            <div key={i} style={{
+                              background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                              padding: '10px 12px', fontSize: 12
+                            }}>
+                              <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', marginBottom: 4 }}>
+                                {file.name}
+                              </div>
+                              <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 6 }}>
+                                📦 {file.package}
+                              </div>
+                              {file.methods?.length > 0 && (
+                                <div style={{ color: 'var(--text3)', fontSize: 10 }}>
+                                  🔧 {file.methods.length} méthodes · 📝 {file.strings?.length || 0} strings
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div style={{ color: 'var(--text2)', fontSize: 12 }}>
+                          {results.java.available === false ? (
+                            <>
+                              ❌ <strong>jadx non détecté</strong> — vérifiez que jadx est dans le PATH.<br />
+                              <span style={{ fontSize: 11, color: 'var(--text3)' }}>
+                                Windows : jadx doit être accessible comme <code>jadx.bat</code> dans le PATH.<br />
+                                Linux/macOS : <code>apt install jadx</code> ou <code>brew install jadx</code>
+                              </span>
+                            </>
+                          ) : results.java.error ? (
+                            <>
+                              ⚠️ <strong>Erreur jadx :</strong> {results.java.error}
+                            </>
+                          ) : (
+                            <>⚠️ Décompilation terminée mais aucun fichier Java produit.</>
+                          )}
+                        </div>
+                      )}
+                    </Card>
+                  )}
+
+                  {/* Secrets Detected */}
+                  {results?.secrets && results.secrets.length > 0 && (
+                    <Card>
+                      <SectionTitle icon="alert-triangle" count={results.secrets.length}>🔓 Secrets détectés dans le code</SectionTitle>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {results.secrets.map((secret, i) => (
+                          <div key={i} style={{
+                            background: '#3d1a1a', border: '1px solid #f85149',
+                            borderRadius: 'var(--radius)', padding: '10px 12px', fontSize: 11
+                          }}>
+                            <div style={{ color: '#f85149', fontWeight: 600, marginBottom: 4 }}>
+                              🔑 {secret.type.toUpperCase()}
+                            </div>
+                            <div style={{ fontFamily: 'var(--mono)', wordBreak: 'break-all', color: 'var(--text)', marginBottom: 4 }}>
+                              {secret.value.slice(0, 100)}
+                            </div>
+                            <div style={{ color: 'var(--text3)', fontSize: 10 }}>
+                              @ {secret.file}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* Smali Files */}
+                  {results?.smali?.smali_files && results.smali.smali_files.length > 0 && (
+                    <Card>
+                      <SectionTitle icon="assembly" count={results.smali.smali_files.length}>Fichiers Smali</SectionTitle>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        {results.smali.smali_files.slice(0, 10).map((file, i) => (
+                          <div key={i} style={{
+                            background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                            padding: '8px 10px', fontSize: 10
+                          }}>
+                            <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', marginBottom: 2 }}>
+                              {file.name}
+                            </div>
+                            <div style={{ color: 'var(--text2)', fontSize: 9 }}>
+                              📍 {file.path}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </Card>
+                  )}
                 </>
               )}
             </div>

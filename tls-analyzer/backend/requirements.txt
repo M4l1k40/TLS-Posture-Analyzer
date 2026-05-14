@@ -2,3 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 httpx==0.27.2
+python-dotenv==1.0.0
+
+# OPTIONNEL - Décompilation complète (installez apktool et jadx pour utiliser /decompile/*)
+# apktool (décompilation Smali):  apt install apktool (Linux) | brew install apktool (macOS)
+# jadx (décompilation Java):       apt install jadx (Linux) | brew install jadx (macOS)
+

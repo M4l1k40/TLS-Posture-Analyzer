@@ -26,6 +26,38 @@ export async function analyzeHAR(file) {
   return res.json()
 }
 
+// ── DÉCOMPILATION ──────────────────────────────────────────────────────────
+
+export async function decompileSmali(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${BASE}/decompile/smali`, { method: 'POST', body: form })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function decompileJava(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${BASE}/decompile/java`, { method: 'POST', body: form })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function decompileFull(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${BASE}/decompile/full`, { method: 'POST', body: form })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function checkDecompileTools() {
+  const res = await fetch(`${BASE}/decompile/tools-status`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function streamAI({ prompt, mode, onChunk, onDone }) {
   const res = await fetch(`${BASE}/ai/stream`, {
     method: 'POST',
