@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { analyzeText, analyzeAPK, analyzeHAR, decompileFull, checkDecompileTools, streamAI, checkHealth } from './api.js'
+import DecompilerViewer from './components/DecompilerViewer'
 
 // ── Conversion des résultats backend java_security_checks → format checklist ──
 //
@@ -641,14 +642,14 @@ export default function App() {
     setApkFile(file)
     setLoading(true)
     try {
-      const data = await analyzeAPK(file)
+      const data = await decompileFull(file)
       setResults(data)
       if (data.nsc_xml) setNscXml(data.nsc_xml)
       if (data.raw_strings) setApkText(data.raw_strings.slice(0, 5000))
       setAiSummary(''); setAiRecs('')
       setTab('endpoints')
     } catch (e) {
-      alert('Erreur extraction APK : ' + e.message)
+      alert('Erreur décompilation APK : ' + e.message)
     } finally {
       setLoading(false)
     }
@@ -816,7 +817,21 @@ Génère des recommandations concrètes et priorisées :
   // ── Render ────────────────────────────────────────────────────────────────
 
   const s = results?.stats || {}
-  const anomalyCount = results?.anomalies?.length || 0
+  const javaSecurityAnomalies = (results?.java_security_checks || []).filter(c => c.vulnerable).map(c => ({
+    endpoint: c.label,
+    issue: c.detail,
+    severity: c.severity,
+    source: 'code',
+    found: c.found,
+  }))
+  const combinedAnomalies = [
+    ...(results?.anomalies || []),
+    ...javaSecurityAnomalies,
+  ]
+  const anomalyCount = combinedAnomalies.length
+  const combinedCritical = combinedAnomalies.filter(a => a.severity === 'critical').length
+  const combinedHigh = combinedAnomalies.filter(a => a.severity === 'high').length
+  const combinedMedium = combinedAnomalies.filter(a => a.severity === 'medium').length
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
@@ -880,6 +895,9 @@ Génère des recommandations concrètes et priorisées :
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <Card>
                   <SectionTitle icon="package-import">Analyser un APK</SectionTitle>
+                  <p style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 10 }}>
+                    Chargement APK + décompilation complète Java/Smali pour une analyse TLS approfondie.
+                  </p>
                   <DropZone onFile={runAPKAnalysis} />
                   {apkFile && (
                     <div style={{ marginTop: 10, fontSize: 12, color: 'var(--green)', display: 'flex', gap: 6 }}>
@@ -1028,6 +1046,21 @@ Génère des recommandations concrètes et priorisées :
                           </code>
                           <EnvTag env={ep.env || 'unknown'} />
                           <span style={{ fontSize: 10, color: 'var(--text3)', flexShrink: 0 }}>{ep.type}</span>
+                          {ep.nsc_coverage && (
+                            <span style={{
+                              fontSize: 10,
+                              color: ep.nsc_coverage.status === 'covered' ? '#7ee787' : '#ffb86b',
+                              fontWeight: 600,
+                              flexShrink: 0,
+                            }}>
+                              {ep.nsc_coverage.match_type === 'none' ? 'NSC non couverte' : `NSC ${ep.nsc_coverage.match_type}`}
+                            </span>
+                          )}
+                          {ep.tls_info && (
+                            <span style={{ fontSize: 10, color: ep.tls_info.risk === 'critical' ? 'var(--red)' : ep.tls_info.risk === 'high' ? '#ffb86b' : '#8be9fd', flexShrink: 0 }}>
+                              {ep.tls_info.risk}
+                            </span>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -1073,23 +1106,15 @@ Génère des recommandations concrètes et priorisées :
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
                           <i className="ti ti-list-check" style={{ fontSize: 15, color: 'var(--text2)' }} />
                           <span style={{ fontSize: 13, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                            Checklist Android
+                            Analyse Java TLS
                           </span>
-                          <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, fontSize: 11 }}>
-                            {cl.critical > 0 && (
-                              <span style={{ background: '#3d1a1a', color: '#f85149', padding: '2px 8px', borderRadius: 20, fontWeight: 700 }}>
-                                {cl.critical} critique{cl.critical > 1 ? 's' : ''}
-                              </span>
-                            )}
-                            {cl.high > 0 && (
-                              <span style={{ background: '#2d1f0a', color: '#d29922', padding: '2px 8px', borderRadius: 20 }}>
-                                {cl.high} élevé{cl.high > 1 ? 's' : ''}
-                              </span>
-                            )}
-                            <span style={{ background: 'var(--bg3)', color: 'var(--text2)', padding: '2px 8px', borderRadius: 20 }}>
-                              {cl.passed}/{cl.checks.length} OK
-                            </span>
+                          <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, fontSize: 11, color: 'var(--text2)' }}>
+                            {cl.checks.length} contrôles analysés
                           </span>
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text2)', background: 'var(--bg3)', borderRadius: 'var(--radius)', padding: '10px 14px', marginBottom: 10, display: 'flex', gap: 8 }}>
+                          <i className="ti ti-info-circle" />
+                          Les anomalies de code sont détaillées ci-dessous. Ne vous fiez pas uniquement à un score en haut : lisez chaque contrôle pour voir le contexte exact.
                         </div>
 
                         {!cl.hasAnalysis && (
@@ -1124,22 +1149,22 @@ Génère des recommandations concrètes et priorisées :
                 <p style={{ color: 'var(--text2)', fontSize: 13 }}>Lance d'abord l'analyse dans l'onglet <strong>Entrées</strong>.</p>
               ) : (
                 <>
-                  <div style={{ display: 'flex', gap: 10 }}>
-                    <Metric val={s.critical || 0} label="Critiques"  color="var(--red)" />
-                    <Metric val={results.anomalies.filter(a=>a.severity==='high').length} label="Élevées" color="var(--orange)" />
-                    <Metric val={results.anomalies.filter(a=>a.severity==='medium').length} label="Moyennes" color="var(--accent)" />
-                    <Metric val={results.anomalies.length} label="Total" />
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                    <Metric val={combinedCritical} label="Critiques"  color="var(--red)" />
+                    <Metric val={combinedHigh} label="Élevées" color="var(--orange)" />
+                    <Metric val={combinedMedium} label="Moyennes" color="var(--accent)" />
+                    <Metric val={anomalyCount} label="Total" />
                   </div>
 
                   <Card>
-                    <SectionTitle icon="alert-triangle" count={results.anomalies.length}>
+                    <SectionTitle icon="alert-triangle" count={anomalyCount}>
                       Anomalies détectées
                     </SectionTitle>
-                    {results.anomalies.length === 0 ? (
+                    {anomalyCount === 0 ? (
                       <div style={{ display: 'flex', gap: 8, fontSize: 13, color: 'var(--green)' }}>
                         <i className="ti ti-circle-check" /> Aucune anomalie détectée.
                       </div>
-                    ) : results.anomalies.map((a, i) => (
+                    ) : combinedAnomalies.map((a, i) => (
                       <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
                         <i className="ti ti-alert-triangle" style={{ fontSize: 14, color: 'var(--red)', flexShrink: 0, marginTop: 2 }} />
                         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1228,30 +1253,45 @@ Génère des recommandations concrètes et priorisées :
                   {results?.java && (
                     <Card>
                       <SectionTitle icon="file-code" count={results.java.java_files?.length || 0}>Fichiers Java décompilés</SectionTitle>
-                      {results.java.java_files?.length > 0 ? (
+                      {/* Badge mode de décompilation */}
+                      {results.decompile_mode && results.decompile_mode !== 'none' && (
+                        <div style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 6,
+                          padding: '4px 10px', borderRadius: 20, marginBottom: 10, fontSize: 11, fontWeight: 600,
+                          background: results.decompile_mode === 'standard' ? '#1a3d1a'
+                            : results.decompile_mode === 'permissive' ? '#3d2e00'
+                            : results.decompile_mode === 'partial' ? '#3d1a00'
+                            : '#3d1a1a',
+                          color: results.decompile_mode === 'standard' ? 'var(--green)'
+                            : results.decompile_mode === 'permissive' ? '#e3b341'
+                            : results.decompile_mode === 'partial' ? '#ff9960'
+                            : 'var(--red)',
+                          border: `1px solid ${results.decompile_mode === 'standard' ? 'var(--green)' : results.decompile_mode === 'permissive' ? '#e3b341' : results.decompile_mode === 'partial' ? '#ff9960' : 'var(--red)'}`,
+                        }}>
+                          {results.decompile_mode === 'standard' && '✓ Mode standard'}
+                          {results.decompile_mode === 'permissive' && '⚠ Mode permissif (APK obfusqué)'}
+                          {results.decompile_mode === 'partial' && '⚡ Mode partiel (APK protégé)'}
+                          {results.decompile_mode === 'failed' && '✗ Décompilation impossible'}
+                          {!['standard','permissive','partial','failed'].includes(results.decompile_mode) && results.decompile_mode}
+                        </div>
+                      )}
+                      {/* Warning mode permissif / partiel */}
+                      {results.warning && (
+                        <div style={{
+                          background: '#2d2200', border: '1px solid #e3b341',
+                          borderRadius: 'var(--radius)', padding: '8px 12px',
+                          fontSize: 11, color: '#e3b341', marginBottom: 10
+                        }}>
+                          ⚠️ {results.warning}
+                        </div>
+                      )}
+                      {results.java?.java_files?.length > 0 ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                          {results.java.java_files.slice(0, 20).map((file, i) => (
-                            <div key={i} style={{
-                              background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
-                              padding: '10px 12px', fontSize: 12
-                            }}>
-                              <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', marginBottom: 4 }}>
-                                {file.name}
-                              </div>
-                              <div style={{ color: 'var(--text2)', fontSize: 11, marginBottom: 6 }}>
-                                📦 {file.package}
-                              </div>
-                              {file.methods?.length > 0 && (
-                                <div style={{ color: 'var(--text3)', fontSize: 10 }}>
-                                  🔧 {file.methods.length} méthodes · 📝 {file.strings?.length || 0} strings
-                                </div>
-                              )}
-                            </div>
-                          ))}
+                          <DecompilerViewer javaFiles={results.java.java_files} anomalies={results.anomalies || []} />
                         </div>
                       ) : (
                         <div style={{ color: 'var(--text2)', fontSize: 12 }}>
-                          {results.java.available === false ? (
+                          {results.java?.available === false ? (
                             <>
                               ❌ <strong>jadx non détecté</strong> — vérifiez que jadx est dans le PATH.<br />
                               <span style={{ fontSize: 11, color: 'var(--text3)' }}>
@@ -1259,10 +1299,16 @@ Génère des recommandations concrètes et priorisées :
                                 Linux/macOS : <code>apt install jadx</code> ou <code>brew install jadx</code>
                               </span>
                             </>
-                          ) : results.java.error ? (
-                            <>
-                              ⚠️ <strong>Erreur jadx :</strong> {results.java.error}
-                            </>
+                          ) : results.java?.error || results.error ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                              <div>⚠️ <strong>Erreur jadx :</strong> {results.java?.error || results.error}</div>
+                              <div style={{ fontSize: 11, color: 'var(--text3)', background: 'var(--bg3)', padding: '8px 10px', borderRadius: 'var(--radius)' }}>
+                                💡 <strong>Analyse de repli activée</strong> — les endpoints, anomalies et checks TLS ont été extraits
+                                depuis les strings brutes et fichiers Smali de l'APK.
+                                {results.java_security_checks_source === 'smali_fallback' && ' (source : Smali)'}
+                                {results.java_security_checks_source === 'raw_fallback' && ' (source : strings brutes)'}
+                              </div>
+                            </div>
                           ) : (
                             <>⚠️ Décompilation terminée mais aucun fichier Java produit.</>
                           )}

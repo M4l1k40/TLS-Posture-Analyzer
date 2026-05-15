@@ -303,84 +303,302 @@ def parse_manifest(manifest_text: str) -> List[Dict]:
 # ── NSC XML parser ─────────────────────────────────────────────────────────────
 
 def parse_nsc_xml(xml_text: str) -> List[Dict]:
+    """
+    Parse un Network Security Config XML et retourne les checks de sécurité.
+    Compatible avec :
+    - XML saisi manuellement par l'utilisateur
+    - XML décodé depuis AXML (via decode_axml ou apktool)
+    - XML produit par apktool (attributs avec ou sans namespace android:)
+    """
     checks = []
 
-    # ── 1. Cleartext Traffic ──────────────────────────────────────────────────
-    cleartext = re.search(r'cleartextTrafficPermitted\s*=\s*["\']?(true)["\']?', xml_text, re.IGNORECASE)
+    if not xml_text or not xml_text.strip():
+        return checks
+
+    xml_norm = xml_text.strip().replace('\x00', '')
+
+    def local_name(tag: str) -> str:
+        return tag.split('}')[-1] if '}' in tag else tag
+
+    def get_attr(elem: ET.Element, name: str):
+        if name in elem.attrib:
+            return elem.attrib[name]
+        for key, value in elem.attrib.items():
+            if key == name or key.endswith('}' + name):
+                return value
+        return None
+
+    def is_true(value: str) -> bool:
+        return str(value).strip().lower() in ('true', '1', 'yes')
+
+    def findall(root: ET.Element, tag: str):
+        return [elem for elem in root.iter() if local_name(elem.tag) == tag]
+
+    def parse_fallback(text: str):
+        return parse_nsc_xml_regex(text)
+
+    def parse_nsc_xml_regex(text: str) -> List[Dict]:
+        xml_fallback = text.replace('android:', '')
+        cleartext = re.search(
+            r'cleartextTrafficPermitted\s*=\s*["\']?(true)["\']?',
+            xml_fallback, re.IGNORECASE
+        )
+        cleartext_domain = re.search(
+            r'<(?:base|domain)-config[^>]*cleartextTrafficPermitted\s*=\s*["\']?(true)["\']?',
+            xml_fallback, re.IGNORECASE
+        )
+        has_cleartext = bool(cleartext) or bool(cleartext_domain)
+        checks = [{
+            "label": "Cleartext Traffic autorisé",
+            "ok": not has_cleartext,
+            "detail": (
+                "cleartextTrafficPermitted=true trouvé — trafic HTTP non chiffré autorisé !"
+                if has_cleartext else "Non autorisé ✓"
+            ),
+            "severity": "critical" if has_cleartext else "low",
+        }]
+        user_certs = re.search(r'src\s*=\s*["\']user["\']', xml_fallback, re.IGNORECASE)
+        debug_user = re.search(
+            r'<debug-overrides>.*?<certificates\s+src\s*=\s*["\']user["\']',
+            xml_fallback, re.IGNORECASE | re.DOTALL
+        )
+        non_debug_user = user_certs and not (
+            debug_user and user_certs.start() >= debug_user.start()
+            and user_certs.end() <= (debug_user.end() if debug_user else 0)
+        )
+        checks.append({
+            "label": "Certificats utilisateur approuvés",
+            "ok": not bool(non_debug_user),
+            "detail": (
+                "Certificats user acceptés (hors debug-overrides) — interception MITM triviale"
+                if non_debug_user else "Seuls les CA système acceptés ✓"
+            ),
+            "severity": "high" if non_debug_user else "low",
+        })
+        tls_version = re.search(
+            r'tlsVersion\s*=\s*["\']?(TLSv[\d.]+)["\']?', xml_fallback, re.IGNORECASE
+        )
+        min_sdk = re.search(r'minSdkVersion\s*=\s*["\']?(\d+)["\']?', xml_fallback)
+        if tls_version:
+            version_str = tls_version.group(1)
+            is_weak = version_str in ("TLSv1.0", "TLSv1.1")
+            checks.append({
+                "label": "Version TLS minimale déclarée",
+                "ok": not is_weak,
+                "detail": f"tlsVersion = {version_str} — {'⚠️ version obsolète, utiliser TLSv1.2+' if is_weak else '✓'}",
+                "severity": "high" if is_weak else "low",
+            })
+        elif min_sdk:
+            sdk = int(min_sdk.group(1))
+            ok = sdk >= 29
+            checks.append({
+                "label": "Version TLS minimale (via minSdkVersion)",
+                "ok": ok,
+                "detail": f"minSdkVersion = {sdk} → {'TLS 1.3 par défaut ✓' if sdk >= 29 else 'TLS 1.2 minimum recommandé (API 29+)'}",
+                "severity": "low" if ok else "medium",
+            })
+        else:
+            checks.append({
+                "label": "Version TLS minimale déclarée",
+                "ok": False,
+                "detail": "Aucune version TLS ni minSdkVersion spécifiée — dépend de l'OS",
+                "severity": "medium",
+            })
+        has_pin_set = bool(re.search(r'<pin-set', xml_fallback))
+        has_pins = bool(re.search(r'<pin[\s>/]', xml_fallback))
+        if has_pin_set and has_pins:
+            pinned_domains = re.findall(r'<domain[^>]*>\s*([^<]+)\s*</domain>', xml_fallback)
+            pin_values = re.findall(
+                r'<pin[^>]*digest\s*=\s*["\']([^"\']+)["\'][^>]*>([^<]+)</pin>', xml_fallback
+            )
+            expiry = re.search(r'expiration\s*=\s*["\']([^"\']+)["\']', xml_fallback)
+            detail_parts = [
+                f"Pins déclarés pour : {', '.join(pinned_domains) if pinned_domains else 'domaines non parsés'} ✓",
+                f"{len(pin_values)} pin(s) SHA-256 configuré(s)",
+            ]
+            if expiry:
+                detail_parts.append(f"Expiration : {expiry.group(1)}")
+            else:
+                detail_parts.append("⚠️ Pas de date d'expiration — risque de blocage si cert change")
+            checks.append({
+                "label": "Certificate Pinning (NSC)",
+                "ok": True,
+                "detail": " | ".join(detail_parts),
+                "severity": "low",
+                "pinned_domains": pinned_domains,
+                "pin_count": len(pin_values),
+            })
+        elif has_pin_set and not has_pins:
+            checks.append({
+                "label": "Certificate Pinning (NSC)",
+                "ok": False,
+                "detail": "⚠️ <pin-set> déclaré mais aucun <pin> trouvé — pinning non fonctionnel !",
+                "severity": "high",
+            })
+        else:
+            checks.append({
+                "label": "Certificate Pinning (NSC)",
+                "ok": False,
+                "detail": "Aucun pin déclaré — validation CA standard uniquement (MITM possible avec CA compromis)",
+                "severity": "high",
+            })
+        debug_override = bool(re.search(r'<debug-overrides', xml_fallback))
+        checks.append({
+            "label": "Debug overrides présents",
+            "ok": not debug_override,
+            "detail": (
+                "⚠️ <debug-overrides> détecté — certificats user acceptés en debug, à retirer en prod !"
+                if debug_override else "Pas de debug-overrides ✓"
+            ),
+            "severity": "medium" if debug_override else "low",
+        })
+        has_base_config = bool(re.search(r'<(?:base|domain)-config', xml_fallback))
+        force_https = has_base_config and not has_cleartext
+        checks.append({
+            "label": "Trafic HTTPS forcé (base-config)",
+            "ok": force_https,
+            "detail": (
+                "Configuration base-config présente sans cleartext ✓ — vérifier HSTS côté backend"
+                if force_https else "Aucune base-config HTTPS forcée détectée"
+            ),
+            "severity": "low" if force_https else "medium",
+        })
+        return checks
+
+    try:
+        root = ET.fromstring(xml_norm)
+    except ET.ParseError:
+        return parse_fallback(xml_norm)
+
+    all_elements = list(root.iter())
+    base_configs = findall(root, 'base-config')
+    domain_configs = findall(root, 'domain-config')
+    pin_sets = findall(root, 'pin-set')
+    debug_overrides = findall(root, 'debug-overrides')
+    certificates = findall(root, 'certificates')
+
+    def element_in_debug_override(elem: ET.Element) -> bool:
+        return any(elem in list(debug.iter()) for debug in debug_overrides)
+
+    cleartext_explicit = False
+    cleartext_allowed = False
+    for config in base_configs + domain_configs:
+        attr = get_attr(config, 'cleartextTrafficPermitted')
+        if attr is not None:
+            cleartext_explicit = True
+            if is_true(attr):
+                cleartext_allowed = True
+
+    has_nsc_config = bool(base_configs or domain_configs)
     checks.append({
-        "label": "Cleartext Traffic autorisé",
-        "ok": not bool(cleartext),
-        "detail": "cleartextTrafficPermitted=true trouvé — trafic HTTP non chiffré autorisé !" if cleartext else "Non autorisé ✓",
-        "severity": "critical" if cleartext else "low",
+        "label": "Network Security Config déclaré",
+        "ok": has_nsc_config,
+        "detail": (
+            "NSC configuré avec base-config/domain-config ✓"
+            if has_nsc_config else "Aucun base-config/domain-config détecté — NSC présent mais vide ou incomplet"
+        ),
+        "severity": "low" if has_nsc_config else "medium",
     })
 
-    # ── 2. Certificats utilisateur ────────────────────────────────────────────
-    user_certs = re.search(r'src\s*=\s*["\']user["\']', xml_text)
+    if cleartext_allowed:
+        checks.append({
+            "label": "Cleartext Traffic autorisé",
+            "ok": False,
+            "detail": "cleartextTrafficPermitted=true détecté dans la configuration NSC — trafic HTTP non chiffré autorisé !",
+            "severity": "critical",
+        })
+    elif cleartext_explicit:
+        checks.append({
+            "label": "Cleartext Traffic autorisé",
+            "ok": True,
+            "detail": "cleartextTrafficPermitted=false détecté — cleartext bloqué explicitement ✓",
+            "severity": "low",
+        })
+    else:
+        checks.append({
+            "label": "Cleartext Traffic autorisé",
+            "ok": False,
+            "detail": "Aucune option cleartextTrafficPermitted explicite trouvée — comportement par défaut incertain selon l'OS et la cible API.",
+            "severity": "medium",
+        })
+
+    user_certs = [cert for cert in certificates if get_attr(cert, 'src') == 'user']
+    non_debug_user = any(
+        cert for cert in user_certs if not element_in_debug_override(cert)
+    )
     checks.append({
         "label": "Certificats utilisateur approuvés",
-        "ok": not bool(user_certs),
-        "detail": "Certificats user acceptés — interception MITM triviale" if user_certs else "Seuls les CA système acceptés ✓",
-        "severity": "high" if user_certs else "low",
+        "ok": not bool(non_debug_user),
+        "detail": (
+            "Certificats user acceptés hors debug-overrides — interception MITM triviale"
+            if non_debug_user else "Seuls les CA système acceptés ✓"
+        ),
+        "severity": "high" if non_debug_user else "low",
     })
 
-    # ── 3. Version TLS minimale ───────────────────────────────────────────────
-    # Cherche tlsVersion (Android 10+) ET minSdkVersion comme fallback
-    tls_version = re.search(r'tlsVersion\s*=\s*["\']?(TLSv[\d.]+)["\']?', xml_text, re.IGNORECASE)
-    min_sdk = re.search(r'minSdkVersion\s*=\s*["\']?(\d+)["\']?', xml_text)
-
-    if tls_version:
-        version_str = tls_version.group(1)
-        is_weak = version_str in ("TLSv1.0", "TLSv1.1")
+    tls_versions = []
+    for elem in all_elements:
+        tls = get_attr(elem, 'tlsVersion')
+        if tls:
+            tls_versions.append(tls.strip())
+    tls_versions = [v for v in tls_versions if v]
+    if tls_versions:
+        version_str = tls_versions[0]
+        is_weak = version_str in ('TLSv1.0', 'TLSv1.1')
         checks.append({
             "label": "Version TLS minimale déclarée",
             "ok": not is_weak,
             "detail": f"tlsVersion = {version_str} — {'⚠️ version obsolète, utiliser TLSv1.2+' if is_weak else '✓'}",
             "severity": "high" if is_weak else "low",
         })
-    elif min_sdk:
-        sdk = int(min_sdk.group(1))
-        # API 29+ = Android 10 = TLS 1.3 par défaut
-        ok = sdk >= 29
-        checks.append({
-            "label": "Version TLS minimale (via minSdkVersion)",
-            "ok": ok,
-            "detail": f"minSdkVersion = {sdk} → {'TLS 1.3 par défaut ✓' if sdk >= 29 else 'TLS 1.2 minimum recommandé (API 29+)'}",
-            "severity": "low" if ok else "medium",
-        })
     else:
-        checks.append({
-            "label": "Version TLS minimale déclarée",
-            "ok": False,
-            "detail": "Aucune version TLS ni minSdkVersion spécifiée — dépend de l'OS",
-            "severity": "medium",
-        })
-
-    # ── 4. Certificate Pinning ────────────────────────────────────────────────
-    has_pin_set = bool(re.search(r'<pin-set', xml_text))
-    has_pins    = bool(re.search(r'<pin\s', xml_text))
-
-    if has_pin_set and has_pins:
-        # Extraire les domaines qui ont des pins
-        pinned_domains = re.findall(r'<domain[^>]*>\s*([^<]+)\s*</domain>', xml_text)
-        pin_values     = re.findall(r'<pin[^>]*digest=["\']([^"\']+)["\'][^>]*>([^<]+)</pin>', xml_text)
-        expiry         = re.search(r'expiration\s*=\s*["\']([^"\']+)["\']', xml_text)
-
-        detail_parts = [f"Pins déclarés pour : {', '.join(pinned_domains) if pinned_domains else 'domaines non parsés'} ✓"]
-        detail_parts.append(f"{len(pin_values)} pin(s) SHA-256 configuré(s)")
-        if expiry:
-            detail_parts.append(f"Expiration : {expiry.group(1)}")
+        min_sdk_attr = None
+        for elem in all_elements:
+            value = get_attr(elem, 'minSdkVersion')
+            if value and value.isdigit():
+                min_sdk_attr = int(value)
+                break
+        if min_sdk_attr is not None:
+            ok = min_sdk_attr >= 29
+            checks.append({
+                "label": "Version TLS minimale (via minSdkVersion)",
+                "ok": ok,
+                "detail": f"minSdkVersion = {min_sdk_attr} → {'TLS 1.3 par défaut ✓' if ok else 'TLS 1.2 minimum recommandé (API 29+)'}",
+                "severity": "low" if ok else "medium",
+            })
         else:
-            detail_parts.append("⚠️ Pas de date d'expiration — risque de blocage permanent si cert change")
+            checks.append({
+                "label": "Version TLS minimale déclarée",
+                "ok": False,
+                "detail": "Aucune version TLS ni minSdkVersion spécifiée — dépend de l'OS",
+                "severity": "medium",
+            })
 
+    pinned_domains = []
+    pin_count = 0
+    pin_values = []
+    for pin_set in pin_sets:
+        for child in pin_set.iter():
+            if local_name(child.tag) == 'domain' and child.text:
+                pinned_domains.append(child.text.strip())
+            if local_name(child.tag) == 'pin':
+                pin_count += 1
+                digest = get_attr(child, 'digest')
+                if digest:
+                    pin_values.append(digest.strip())
+    if pin_sets and pin_count > 0:
         checks.append({
             "label": "Certificate Pinning (NSC)",
             "ok": True,
-            "detail": " | ".join(detail_parts),
+            "detail": (
+                f"Pins déclarés pour : {', '.join(pinned_domains) if pinned_domains else 'domaines non parsés'} ✓ — {pin_count} pin(s)"
+                + (f" | digest: {', '.join(pin_values[:3])}" if pin_values else '')
+            ),
             "severity": "low",
             "pinned_domains": pinned_domains,
-            "pin_count": len(pin_values),
+            "pin_count": pin_count,
         })
-    elif has_pin_set and not has_pins:
+    elif pin_sets:
         checks.append({
             "label": "Certificate Pinning (NSC)",
             "ok": False,
@@ -395,22 +613,25 @@ def parse_nsc_xml(xml_text: str) -> List[Dict]:
             "severity": "high",
         })
 
-    # ── 5. Debug overrides ────────────────────────────────────────────────────
-    debug_override = bool(re.search(r'<debug-overrides', xml_text))
+    debug_override = bool(debug_overrides)
     checks.append({
         "label": "Debug overrides présents",
         "ok": not debug_override,
-        "detail": "⚠️ <debug-overrides> détecté — certificats user acceptés en debug, à retirer en prod !" if debug_override else "Pas de debug-overrides ✓",
+        "detail": (
+            "⚠️ <debug-overrides> détecté — certificats user acceptés en debug, à retirer en prod !"
+            if debug_override else "Pas de debug-overrides ✓"
+        ),
         "severity": "medium" if debug_override else "low",
     })
 
-    # ── 6. HSTS (vérification côté NSC) ──────────────────────────────────────
-    # HSTS est côté serveur mais on peut détecter si l'app force HTTPS
-    force_https = not bool(cleartext) and bool(re.search(r'<domain-config|<base-config', xml_text))
+    force_https = has_nsc_config and not cleartext_allowed
     checks.append({
-        "label": "Trafic HTTPS forcé (base-config)",
+        "label": "Trafic HTTPS forcé (base-config/domain-config)",
         "ok": force_https,
-        "detail": "Configuration base-config présente sans cleartext ✓ — vérifier HSTS côté backend (Strict-Transport-Security header)" if force_https else "Aucune base-config HTTPS forcée détectée",
+        "detail": (
+            "Configuration NSC présente sans cleartext ✓ — HTTPS forcé par NSC"
+            if force_https else "Aucune configuration NSC forçant HTTPS détectée"
+        ),
         "severity": "low" if force_https else "medium",
     })
 
@@ -439,18 +660,55 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
     - Authenticator custom
     """
     results = []
+    # Supporte soit une chaîne agrégée, soit une liste de dicts {path, content}
+    full_text = ""
+    java_files = None
+    if isinstance(java_code, list):
+        java_files = java_code
+        for f in java_code:
+            full_text += f.get("content", "") + "\n"
+    else:
+        full_text = java_code
+
+    def _find_evidence(pattern: str):
+        """Recherche le pattern dans les fichiers Java (si fournis) et renvoie (file, snippet)"""
+        try:
+            regex = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+        except re.error:
+            regex = re.compile(pattern, re.IGNORECASE)
+
+        if java_files:
+            for f in java_files:
+                content = f.get("content", "")
+                m = regex.search(content)
+                if m:
+                    start = max(0, m.start() - 60)
+                    end = min(len(content), m.end() + 60)
+                    snippet = content[start:end].strip()
+                    return {"file": f.get("path"), "snippet": snippet}
+
+        # Fallback to full_text search
+        m = regex.search(full_text)
+        if m:
+            start = max(0, m.start() - 60)
+            end = min(len(full_text), m.end() + 60)
+            return {"file": None, "snippet": full_text[start:end].strip()}
+        return {"file": None, "snippet": ""}
     
     # ── 1. TrustManager custom ────────────────────────────────────────────────
-    has_trustmanager = bool(re.search(r'implements\s+X509TrustManager|extends\s+\w*TrustManager', java_code, re.IGNORECASE))
-    
+    has_trustmanager = bool(re.search(r'implements\s+X509TrustManager|extends\s+\w*TrustManager', full_text, re.IGNORECASE))
+
     if has_trustmanager:
-        checkserver_empty = bool(re.search(r'checkServerTrusted\s*\([^)]*\)\s*\{[\s\n]*\}', java_code))
+        checkserver_empty = bool(re.search(r'checkServerTrusted\s*\([^)]*\)\s*\{\s*(?:/\*[\s\S]*?\*/\s*)*(?:\/\/[^\n]*\n\s*)*\}', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'checkServerTrusted\s*\(')
         results.append({
             "label": "TrustManager custom",
             "found": True,
             "detail": "checkServerTrusted() vide — TLS bypasse ⚠️ CRITIQUE" if checkserver_empty else "TrustManager custom implémenté",
             "severity": "critical" if checkserver_empty else "high",
             "vulnerable": checkserver_empty,
+            "evidence": evidence,
+            "why": f"Match pattern 'checkServerTrusted(...)' dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -462,16 +720,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 2. HostnameVerifier custom ────────────────────────────────────────────
-    has_hostnameverifier = bool(re.search(r'implements\s+HostnameVerifier|AllowAllHostnameVerifier', java_code, re.IGNORECASE))
-    
+    has_hostnameverifier = bool(re.search(r'implements\s+HostnameVerifier|AllowAllHostnameVerifier', full_text, re.IGNORECASE))
+
     if has_hostnameverifier:
-        verify_true = bool(re.search(r'verify\s*\([^)]*\)\s*\{[^}]*return\s+true[^}]*\}', java_code))
+        verify_true = bool(re.search(r'verify\s*\([^)]*\)\s*\{[^}]*return\s+true[^}]*\}', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'verify\s*\(')
         results.append({
             "label": "HostnameVerifier custom",
             "found": True,
             "detail": "verify() → true — MITM possible ⚠️ CRITIQUE" if verify_true else "HostnameVerifier custom",
             "severity": "critical" if verify_true else "high",
             "vulnerable": verify_true,
+            "evidence": evidence,
+            "why": f"Pattern 'HostnameVerifier.verify(...)' trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -483,16 +744,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 3. WebView onReceivedSslError ────────────────────────────────────────
-    has_webview_ssl_error = bool(re.search(r'onReceivedSslError\s*\([^)]*\)', java_code, re.IGNORECASE))
-    
+    has_webview_ssl_error = bool(re.search(r'onReceivedSslError\s*\([^)]*\)', full_text, re.IGNORECASE))
+
     if has_webview_ssl_error:
-        handler_proceed = bool(re.search(r'handler\.proceed\s*\(\s*\)', java_code))
+        handler_proceed = bool(re.search(r'handler\.proceed\s*\(\s*\)', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'onReceivedSslError\s*\(')
         results.append({
             "label": "WebView onReceivedSslError",
             "found": True,
             "detail": "handler.proceed() — SSL/TLS errors ignorées ⚠️ CRITIQUE" if handler_proceed else "onReceivedSslError géré",
             "severity": "critical" if handler_proceed else "medium",
             "vulnerable": handler_proceed,
+            "evidence": evidence,
+            "why": f"onReceivedSslError handler trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -504,17 +768,25 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 4. OkHttp CertificatePinner ──────────────────────────────────────────
-    has_certpinner = bool(re.search(r'CertificatePinner|pin\s*\(["\']', java_code, re.IGNORECASE))
-    
+    has_certpinner = bool(re.search(r'CertificatePinner|pin\s*\(["\']', full_text, re.IGNORECASE))
+
     if has_certpinner:
-        has_sha256 = bool(re.search(r'sha256/|SHA-256|sha256', java_code, re.IGNORECASE))
+        has_sha256 = bool(re.search(r'sha256/|SHA-256|sha256', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'CertificatePinner|pin\s*\(')
         results.append({
             "label": "OkHttp CertificatePinner",
             "found": True,
             "detail": "Certificate Pinning configuré ✓" if has_sha256 else "CertificatePinner détecté",
             "severity": "low" if has_sha256 else "medium",
             "vulnerable": False,
+            "evidence": evidence,
+            "why": f"CertificatePinner/pin pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
+        # Enrichir avec parsing déterministe des pins si on a les fichiers
+        if java_files:
+            parsed_pins = parse_certificate_pins_from_java(java_files)
+            if parsed_pins:
+                results[-1]["parsed_pins"] = parsed_pins
     else:
         results.append({
             "label": "OkHttp CertificatePinner",
@@ -525,17 +797,25 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 5. TLS 1.2 minimum ────────────────────────────────────────────────────
-    has_tls_config = bool(re.search(r'SSLSocketFactory|setEnabledProtocols|TLSv1\.[23]', java_code, re.IGNORECASE))
-    
+    has_tls_config = bool(re.search(r'SSLSocketFactory|setEnabledProtocols|TLSv1\.[23]', full_text, re.IGNORECASE))
+
     if has_tls_config:
-        has_weak_tls = bool(re.search(r'SSLv3|TLSv1\.0', java_code))
+        has_weak_tls = bool(re.search(r'SSLv3|TLSv1\.0', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'SSLSocketFactory|setEnabledProtocols|TLSv1\.[23]')
         results.append({
             "label": "TLS 1.2 minimum",
             "found": True,
             "detail": "TLS faible (SSLv3/1.0) détecté ⚠️" if has_weak_tls else "TLS 1.2+ configuré ✓",
             "severity": "high" if has_weak_tls else "low",
             "vulnerable": has_weak_tls,
+            "evidence": evidence,
+            "why": f"Pattern TLS trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
+        # Enrichir avec parsing déterministe des versions TLS
+        if java_files:
+            parsed_tls = parse_tls_versions_from_java(java_files)
+            if parsed_tls:
+                results[-1]["parsed_tls_versions"] = parsed_tls
     else:
         results.append({
             "label": "TLS 1.2 minimum",
@@ -546,15 +826,18 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 6. Cipher suites modernes ────────────────────────────────────────────
-    has_cipher_spec = bool(re.search(r'ConnectionSpec\.MODERN_TLS|setEnabledCipherSuites', java_code, re.IGNORECASE))
-    
+    has_cipher_spec = bool(re.search(r'ConnectionSpec\.MODERN_TLS|setEnabledCipherSuites', full_text, re.IGNORECASE))
+
     if has_cipher_spec:
+        evidence = _find_evidence(r'ConnectionSpec\.MODERN_TLS|setEnabledCipherSuites')
         results.append({
             "label": "Cipher suite moderne",
             "found": True,
             "detail": "Cipher suites configurées ✓",
             "severity": "low",
             "vulnerable": False,
+            "evidence": evidence,
+            "why": f"Cipher suites pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -566,16 +849,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 7. HttpURLConnection custom ──────────────────────────────────────────
-    has_httpurlconnection = bool(re.search(r'HttpURLConnection|openConnection\s*\(\s*\)', java_code, re.IGNORECASE))
-    
+    has_httpurlconnection = bool(re.search(r'HttpURLConnection|openConnection\s*\(\s*\)', full_text, re.IGNORECASE))
+
     if has_httpurlconnection:
-        custom_ssl = bool(re.search(r'setSSLSocketFactory|setDefaultSSLSocketFactory', java_code, re.IGNORECASE))
+        custom_ssl = bool(re.search(r'setSSLSocketFactory|setDefaultSSLSocketFactory', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'HttpURLConnection|openConnection\s*\(')
         results.append({
             "label": "HttpURLConnection custom",
             "found": True,
             "detail": "Config SSL/TLS personnalisée ⚠️" if custom_ssl else "HttpURLConnection utilisé",
             "severity": "high" if custom_ssl else "medium",
             "vulnerable": custom_ssl,
+            "evidence": evidence,
+            "why": f"HttpURLConnection pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -587,16 +873,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 8. SSLContext personnalisé ───────────────────────────────────────────
-    has_sslcontext = bool(re.search(r'SSLContext\.getInstance|\.init\s*\([^)]*TrustManager', java_code, re.IGNORECASE))
-    
+    has_sslcontext = bool(re.search(r'SSLContext\.getInstance|\.init\s*\([^)]*TrustManager', full_text, re.IGNORECASE))
+
     if has_sslcontext:
-        safe_init = bool(re.search(r'SecureRandom\(\s*\)|getInstance\s*\(\s*["\']TLSv1\.[23]["\']', java_code, re.IGNORECASE))
+        safe_init = bool(re.search(r'SecureRandom\(\s*\)|getInstance\s*\(\s*["\']TLSv1\.[23]["\']', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'SSLContext\.getInstance|\.init\s*\(')
         results.append({
             "label": "SSLContext custom",
             "found": True,
             "detail": "SSLContext initialisé — vérifier TrustManager ⚠️" if not safe_init else "SSLContext sécurisé",
             "severity": "high" if not safe_init else "low",
             "vulnerable": not safe_init,
+            "evidence": evidence,
+            "why": f"SSLContext pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -608,17 +897,20 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 9. OkHttp Interceptors (credentials exposure) ──────────────────────
-    has_interceptor = bool(re.search(r'addInterceptor|NetworkInterceptor', java_code, re.IGNORECASE))
-    
+    has_interceptor = bool(re.search(r'addInterceptor|NetworkInterceptor', full_text, re.IGNORECASE))
+
     if has_interceptor:
         # Chercher si des credentials/tokens sont passés
-        has_tokens = bool(re.search(r'Authorization|Bearer|Token|API[_-]?KEY|Secret|password|credential', java_code, re.IGNORECASE))
+        has_tokens = bool(re.search(r'Authorization|Bearer|Token|API[_-]?KEY|Secret|password|credential', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'addInterceptor|NetworkInterceptor')
         results.append({
             "label": "OkHttp Intercepteurs",
             "found": True,
             "detail": "Credentials/tokens potentiellement exposés ⚠️" if has_tokens else "Intercepteurs configurés",
             "severity": "high" if has_tokens else "medium",
             "vulnerable": has_tokens,
+            "evidence": evidence,
+            "why": f"Interceptor pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -630,16 +922,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 10. Retrofit configuration ────────────────────────────────────────────
-    has_retrofit = bool(re.search(r'Retrofit\.Builder|\.baseUrl', java_code, re.IGNORECASE))
-    
+    has_retrofit = bool(re.search(r'Retrofit\.Builder|\.baseUrl', full_text, re.IGNORECASE))
+
     if has_retrofit:
-        insecure_client = bool(re.search(r'newBuilder\s*\(\s*\)|unsafeClient|\.build\s*\(\s*\)', java_code, re.IGNORECASE)) and not has_certpinner
+        insecure_client = bool(re.search(r'newBuilder\s*\(\s*\)|unsafeClient|\.build\s*\(\s*\)', full_text, re.IGNORECASE)) and not has_certpinner
+        evidence = _find_evidence(r'Retrofit\.Builder|\.baseUrl')
         results.append({
             "label": "Retrofit configuration",
             "found": True,
             "detail": "Retrofit utilisé sans pinning ⚠️" if insecure_client else "Retrofit configuré",
             "severity": "high" if insecure_client else "low",
             "vulnerable": insecure_client,
+            "evidence": evidence,
+            "why": f"Retrofit pattern trouvé dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -651,8 +946,8 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 11. Certificats auto-signés acceptés ────────────────────────────────
-    accepts_selfsigned = bool(re.search(r'X509Certificate|getAcceptedIssuers\s*\(\s*\)\s*\{[\s\n]*return\s+null|PKIX|getSubjectX500Principal', java_code, re.IGNORECASE))
-    
+    accepts_selfsigned = bool(re.search(r'X509Certificate|getAcceptedIssuers\s*\(\s*\)\s*\{[\s\n]*return\s+null|PKIX|getSubjectX500Principal', full_text, re.IGNORECASE))
+
     if accepts_selfsigned:
         results.append({
             "label": "Certificats auto-signés",
@@ -660,6 +955,7 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
             "detail": "Possibilité d'accepter certificats auto-signés ⚠️",
             "severity": "high",
             "vulnerable": True,
+            "evidence": _find_evidence(r'getAcceptedIssuers|accepts?SelfSigned|PKIX'),
         })
     else:
         results.append({
@@ -671,16 +967,19 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 12. WebView mixte content (HTTP + HTTPS) ────────────────────────────
-    mixedcontent = bool(re.search(r'setMixedContentMode|MIXED_CONTENT_ALWAYS_ALLOW', java_code, re.IGNORECASE))
-    
+    mixedcontent = bool(re.search(r'setMixedContentMode|MIXED_CONTENT_ALWAYS_ALLOW', full_text, re.IGNORECASE))
+
     if mixedcontent:
-        always_allow = bool(re.search(r'MIXED_CONTENT_ALWAYS_ALLOW', java_code))
+        always_allow = bool(re.search(r'MIXED_CONTENT_ALWAYS_ALLOW', full_text, re.IGNORECASE))
+        evidence = _find_evidence(r'setMixedContentMode|MIXED_CONTENT_ALWAYS_ALLOW')
         results.append({
             "label": "WebView mixte content",
             "found": True,
             "detail": "HTTP + HTTPS autorisé dans WebView ⚠️ CRITIQUE" if always_allow else "Mixte content configuré",
             "severity": "critical" if always_allow else "high",
             "vulnerable": always_allow,
+            "evidence": evidence,
+            "why": f"WebView mixed content pattern dans {evidence.get('file') or 'le code agrégé'}"
         })
     else:
         results.append({
@@ -702,8 +1001,8 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
     })
     
     # ── 14. ProxySelector custom ─────────────────────────────────────────────
-    has_proxyselector = bool(re.search(r'ProxySelector|\.setDefault|getProxyForURL', java_code, re.IGNORECASE))
-    
+    has_proxyselector = bool(re.search(r'ProxySelector|\.setDefault|getProxyForURL', full_text, re.IGNORECASE))
+
     if has_proxyselector:
         results.append({
             "label": "ProxySelector custom",
@@ -711,6 +1010,7 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
             "detail": "Proxy personnalisé configuré — vérifier sécurité",
             "severity": "high",
             "vulnerable": True,
+            "evidence": _find_evidence(r'ProxySelector|getProxyForURL')
         })
     else:
         results.append({
@@ -722,8 +1022,8 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 15. Authenticator custom ─────────────────────────────────────────────
-    has_authenticator = bool(re.search(r'Authenticator|getPasswordAuthentication|setDefault', java_code, re.IGNORECASE))
-    
+    has_authenticator = bool(re.search(r'Authenticator|getPasswordAuthentication|setDefault', full_text, re.IGNORECASE))
+
     if has_authenticator:
         results.append({
             "label": "Authenticator custom",
@@ -731,6 +1031,7 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
             "detail": "Authentification personnalisée — vérifier credentials handling ⚠️",
             "severity": "high",
             "vulnerable": True,
+            "evidence": _find_evidence(r'Authenticator|getPasswordAuthentication|setDefault')
         })
     else:
         results.append({
@@ -742,8 +1043,8 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 16. OkHttp Endpoint verification disabled ───────────────────────────
-    endpoint_disabled = bool(re.search(r'endpointVerification\s*=\s*false|ENDPOINT_VERIFICATION_DISABLED', java_code, re.IGNORECASE))
-    
+    endpoint_disabled = bool(re.search(r'endpointVerification\s*=\s*false|ENDPOINT_VERIFICATION_DISABLED', full_text, re.IGNORECASE))
+
     if endpoint_disabled:
         results.append({
             "label": "OkHttp Endpoint verification",
@@ -751,6 +1052,7 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
             "detail": "Endpoint verification désactivée ⚠️ CRITIQUE",
             "severity": "critical",
             "vulnerable": True,
+            "evidence": _find_evidence(r'endpointVerification\s*=\s*false|ENDPOINT_VERIFICATION_DISABLED')
         })
     else:
         results.append({
@@ -762,8 +1064,8 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     # ── 17. Cleartext traffic permitted ──────────────────────────────────────
-    cleartext_explicit = bool(re.search(r'usesCleartextTraffic\s*=\s*true|cleartextTrafficPermitted\s*=\s*true', java_code, re.IGNORECASE))
-    
+    cleartext_explicit = bool(re.search(r'usesCleartextTraffic\s*=\s*true|cleartextTrafficPermitted\s*=\s*true', full_text, re.IGNORECASE))
+
     if cleartext_explicit:
         results.append({
             "label": "Cleartext traffic autorisé",
@@ -771,6 +1073,7 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
             "detail": "Trafic HTTP non chiffré autorisé ⚠️ CRITIQUE",
             "severity": "critical",
             "vulnerable": True,
+            "evidence": _find_evidence(r'usesCleartextTraffic\s*=\s*true|cleartextTrafficPermitted\s*=\s*true')
         })
     else:
         results.append({
@@ -782,6 +1085,102 @@ def detect_android_security_patterns(java_code: str) -> List[Dict]:
         })
     
     return results
+
+
+def parse_certificate_pins_from_java(java_files: List[Dict]) -> List[Dict]:
+    """Parse explicit CertificatePinner pin declarations from decompiled Java files.
+
+    Returns list of {host, hash, file, snippet}
+    """
+    pins = []
+    if not java_files:
+        return pins
+
+    # Patterns to catch common OkHttp pin declarations
+    patterns = [
+        re.compile(r'CertificatePinner\.Builder\(\)\s*(?:\.newBuilder\(\))?(?:[\s\S]*?)\.add\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)', re.IGNORECASE),
+        re.compile(r'CertificatePinner\.create\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']', re.IGNORECASE),
+        re.compile(r'add\(\s*["\']([^"\']+)["\']\s*,\s*pin\)', re.IGNORECASE),
+    ]
+
+    for f in java_files:
+        content = f.get("content", "")
+        for pat in patterns:
+            for m in pat.finditer(content):
+                try:
+                    host = m.group(1)
+                    hashv = m.group(2)
+                except Exception:
+                    continue
+                start = max(0, m.start() - 60)
+                end = min(len(content), m.end() + 60)
+                snippet = content[start:end].strip()
+                pins.append({"host": host, "hash": hashv, "file": f.get("path"), "snippet": snippet})
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for p in pins:
+        key = (p["host"], p["hash"], p["file"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+
+    return unique
+
+
+def parse_tls_versions_from_java(java_files: List[Dict]) -> List[Dict]:
+    """Extract explicit TLS version declarations from Java code.
+
+    Returns list of {version, file, snippet}
+    """
+    results = []
+    if not java_files:
+        return results
+
+    # Patterns for enums or string usage
+    patterns = [
+        (re.compile(r'TlsVersion\.TLS_1_3', re.IGNORECASE), 'TLSv1.3'),
+        (re.compile(r'TlsVersion\.TLS_1_2', re.IGNORECASE), 'TLSv1.2'),
+        (re.compile(r'TlsVersion\.TLS_1_1', re.IGNORECASE), 'TLSv1.1'),
+        (re.compile(r'TlsVersion\.TLS_1_0', re.IGNORECASE), 'TLSv1.0'),
+        (re.compile(r'"TLSv1\.?3?"', re.IGNORECASE), None),
+        (re.compile(r'setEnabledProtocols\s*\(\s*new\s+String\s*\[\]\s*\{([^}]+)\}', re.IGNORECASE | re.DOTALL), None),
+        (re.compile(r'ConnectionSpec\.MODERN_TLS', re.IGNORECASE), 'TLSv1.2+'),
+    ]
+
+    for f in java_files:
+        content = f.get("content", "")
+        for pat, v in patterns:
+            for m in pat.finditer(content):
+                snippet = content[max(0, m.start() - 60):min(len(content), m.end() + 60)].strip()
+                if v:
+                    results.append({"version": v, "file": f.get("path"), "snippet": snippet})
+                else:
+                    # Try to extract explicit tokens inside match
+                    grp = m.group(1) if m.groups() else None
+                    if grp:
+                        found = re.findall(r'"(TLSv[0-9\.]+)"', grp)
+                        for ver in found:
+                            results.append({"version": ver, "file": f.get("path"), "snippet": snippet})
+                    else:
+                        # fallback: look for TLSv tokens nearby
+                        nearby = re.findall(r'TLSv1\.\d|TLSv1', snippet, re.IGNORECASE)
+                        for token in nearby:
+                            results.append({"version": token, "file": f.get("path"), "snippet": snippet})
+
+    # Deduplicate by (version, file)
+    seen = set()
+    unique = []
+    for r in results:
+        key = (r.get('version'), r.get('file'))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+
+    return unique
 
 
 # ── ADVANCED FEATURES ── Clustering, TLS Analysis, Certificate Validation ──────────
@@ -1000,6 +1399,210 @@ def validate_certificate_pins(nsc_xml: str, endpoints: List[Dict]) -> List[Dict]
         })
     
     return pin_validation
+
+
+def extract_nsc_domain_rules(xml_text: str) -> Dict[str, Any]:
+    """
+    Parse le NSC pour extraire les règles de base-config et domain-config.
+    Retourne un résumé des domaines couverts, des règles cleartext et du pinning.
+    """
+    rules = {
+        "has_nsc": False,
+        "base_config": None,
+        "domain_configs": [],
+        "debug_overrides": False,
+        "pinned_domains": [],
+    }
+
+    if not xml_text or not xml_text.strip():
+        return rules
+
+    xml_norm = xml_text.strip().replace('\x00', '')
+
+    def local_name(tag: str) -> str:
+        return tag.split('}')[-1] if '}' in tag else tag
+
+    def get_attr(elem: ET.Element, name: str):
+        if name in elem.attrib:
+            return elem.attrib[name]
+        for key, value in elem.attrib.items():
+            if key == name or key.endswith('}' + name):
+                return value
+        return None
+
+    def is_true(value: str) -> bool:
+        return str(value).strip().lower() in ('true', '1', 'yes')
+
+    def findall(root: ET.Element, tag: str):
+        return [elem for elem in root.iter() if local_name(elem.tag) == tag]
+
+    def parse_domain_entries(elem: ET.Element):
+        domains = []
+        for child in elem.iter():
+            if local_name(child.tag) == 'domain' and child.text:
+                domains.append({
+                    'pattern': child.text.strip(),
+                    'include_subdomains': is_true(get_attr(child, 'includeSubdomains')),
+                })
+        if not domains:
+            domain_attr = get_attr(elem, 'domain')
+            if domain_attr:
+                domains.append({
+                    'pattern': domain_attr.strip(),
+                    'include_subdomains': is_true(get_attr(elem, 'includeSubdomains')),
+                })
+        return domains
+
+    def parse_pinned_domains(root: ET.Element):
+        pinned = []
+        for pin in root.iter():
+            if local_name(pin.tag) == 'pin':
+                if pin.text:
+                    pinned.append(pin.text.strip())
+        return pinned
+
+    def parse_fallback(text: str):
+        xml_fallback = text.replace('android:', '')
+        rules['has_nsc'] = bool(re.search(r'<(?:base|domain)-config', xml_fallback, re.IGNORECASE))
+        base_cleartext = None
+        m = re.search(r'<base-config[^>]*cleartextTrafficPermitted\s*=\s*["\'](true|false)["\']', xml_fallback, re.IGNORECASE)
+        if m:
+            base_cleartext = is_true(m.group(1))
+            rules['base_config'] = {'cleartext_allowed': base_cleartext, 'pinning': bool(re.search(r'<pin-set', xml_fallback, re.IGNORECASE))}
+
+        rules['domain_configs'] = []
+        for match in re.finditer(r'<domain-config([^>]*)>([\s\S]*?)</domain-config>', xml_fallback, re.IGNORECASE):
+            attrs, body = match.groups()
+            cleartext = None
+            attr_match = re.search(r'cleartextTrafficPermitted\s*=\s*["\'](true|false)["\']', attrs, re.IGNORECASE)
+            if attr_match:
+                cleartext = is_true(attr_match.group(1))
+            domain_entries = re.findall(r'<domain[^>]*>\s*([^<]+)\s*</domain>', body, re.IGNORECASE)
+            include_sub = bool(re.search(r'includeSubdomains\s*=\s*["\']true["\']', attrs + body, re.IGNORECASE))
+            rules['domain_configs'].append({
+                'domains': [{'pattern': d.strip(), 'include_subdomains': include_sub} for d in domain_entries],
+                'cleartext_allowed': cleartext,
+                'pinning': bool(re.search(r'<pin-set', body, re.IGNORECASE)),
+            })
+
+        rules['debug_overrides'] = bool(re.search(r'<debug-overrides', xml_fallback, re.IGNORECASE))
+        rules['pinned_domains'] = re.findall(r'<domain[^>]*>\s*([^<]+)\s*</domain>', xml_fallback, re.IGNORECASE)
+        return rules
+
+    try:
+        root = ET.fromstring(xml_norm)
+    except ET.ParseError:
+        return parse_fallback(xml_norm)
+
+    rules['has_nsc'] = True
+    base_configs = findall(root, 'base-config')
+    domain_configs = findall(root, 'domain-config')
+    debug_overrides = findall(root, 'debug-overrides')
+
+    if base_configs:
+        base = base_configs[0]
+        cleartext = get_attr(base, 'cleartextTrafficPermitted')
+        rules['base_config'] = {
+            'cleartext_allowed': is_true(cleartext) if cleartext is not None else None,
+            'pinning': bool(findall(base, 'pin-set') or findall(base, 'pin')),
+        }
+
+    for dc in domain_configs:
+        rules['domain_configs'].append({
+            'domains': parse_domain_entries(dc),
+            'cleartext_allowed': is_true(get_attr(dc, 'cleartextTrafficPermitted')) if get_attr(dc, 'cleartextTrafficPermitted') is not None else None,
+            'pinning': bool(findall(dc, 'pin-set') or findall(dc, 'pin')),
+        })
+
+    rules['debug_overrides'] = bool(debug_overrides)
+    rules['pinned_domains'] = parse_pinned_domains(root)
+    return rules
+
+
+def correlate_endpoints_with_nsc(endpoints: List[Dict], nsc_xml: str) -> List[Dict]:
+    """
+    Corrèle chaque endpoint avec la configuration NSC disponible.
+    Retourne la liste des endpoints enrichis par l'état de couverture NSC.
+    """
+    if not endpoints:
+        return []
+
+    rules = extract_nsc_domain_rules(nsc_xml)
+
+    def normalize_host(value: str) -> str:
+        if not value:
+            return ''
+        host = value
+        if host.startswith('http://') or host.startswith('https://'):
+            host = host.split('://', 1)[1]
+        host = host.split('/', 1)[0].split(':', 1)[0]
+        return host.strip().lower()
+
+    def host_matches(host: str, pattern: str, include_subdomains: bool) -> bool:
+        host = host.lower()
+        pattern = pattern.lower()
+        if host == pattern:
+            return True
+        if include_subdomains and host.endswith('.' + pattern):
+            return True
+        return False
+
+    enriched = []
+    for ep in endpoints:
+        host = normalize_host(ep.get('value', ''))
+        matches = []
+        if rules.get('domain_configs'):
+            for dc in rules['domain_configs']:
+                for domain in dc.get('domains', []):
+                    if host_matches(host, domain['pattern'], domain['include_subdomains']):
+                        matches.append({
+                            'source': 'domain_config',
+                            'pattern': domain['pattern'],
+                            'include_subdomains': domain['include_subdomains'],
+                            'cleartext_allowed': dc.get('cleartext_allowed'),
+                            'pinning': dc.get('pinning', False),
+                        })
+        if not matches and rules.get('base_config') is not None:
+            matches.append({
+                'source': 'base_config',
+                'pattern': '<base-config>',
+                'include_subdomains': True,
+                'cleartext_allowed': rules['base_config'].get('cleartext_allowed'),
+                'pinning': rules['base_config'].get('pinning', False),
+            })
+
+        if matches:
+            selected = matches[0]
+            cleartext_allowed = selected.get('cleartext_allowed') is True
+            status = 'covered'
+            if ep.get('value', '').startswith('http://') and not cleartext_allowed:
+                details = 'HTTP clair détecté mais non autorisé par la configuration NSC'
+            elif ep.get('value', '').startswith('http://') and cleartext_allowed:
+                details = 'HTTP clair autorisé par NSC'
+            else:
+                details = 'Endpoint couvert par NSC (' + selected['source'] + ')'
+            nsc_coverage = {
+                'status': status,
+                'match_type': selected['source'],
+                'matched_domains': [m['pattern'] for m in matches],
+                'cleartext_allowed': cleartext_allowed,
+                'pinning': any(m.get('pinning') for m in matches),
+                'details': details,
+            }
+        else:
+            nsc_coverage = {
+                'status': 'uncovered',
+                'match_type': 'none',
+                'matched_domains': [],
+                'cleartext_allowed': False,
+                'pinning': False,
+                'details': 'Aucun domain-config ni base-config NSC ne couvre ce domaine',
+            }
+
+        ep['nsc_coverage'] = nsc_coverage
+        enriched.append(ep)
+
+    return enriched
 
 
 def parse_proxy_log_advanced(log_text: str) -> Dict[str, Any]:

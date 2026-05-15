@@ -15,6 +15,8 @@ from analyzer import (
     parse_nsc_xml,
     detect_anomalies,
     classify_environment,
+    correlate_endpoints_with_nsc,
+    analyze_endpoint_tls_per_endpoint,
 )
 from decompiler import APKDecompiler
 
@@ -101,8 +103,17 @@ async def analyze_text(
         ep["env"] = classify_environment(ep["value"])
     anomalies = detect_anomalies(endpoints)
     tls_checks = parse_nsc_xml(nsc_xml) if nsc_xml.strip() else []
+    endpoint_tls_analysis = analyze_endpoint_tls_per_endpoint(endpoints, nsc_xml)
+    endpoint_coverage = correlate_endpoints_with_nsc(endpoints, nsc_xml) if nsc_xml.strip() else []
+    # Merge TLS analysis results into endpoint objects where possible
+    tls_map = {item["endpoint"]: item for item in endpoint_tls_analysis}
+    for ep in endpoints:
+        if ep["value"] in tls_map:
+            ep["tls_info"] = tls_map[ep["value"]]
     return {
         "endpoints": endpoints,
+        "endpoint_tls_analysis": endpoint_tls_analysis,
+        "endpoint_coverage": endpoint_coverage,
         "anomalies": anomalies,
         "tls_checks": tls_checks,
         "stats": {
@@ -127,19 +138,251 @@ async def analyze_apk(file: UploadFile = File(...)):
     content = await file.read()
     decompiler = APKDecompiler()
     
-    # 1️⃣ EXTRACTION RAPIDE du NSC (zipfile)
+    # 1️⃣ EXTRACTION RAPIDE du NSC et des chaînes brutes utiles pour les vérifications TLS
     nsc_xml = ""
+    raw_parts = []
+
+    # ── Décodeur AXML (Android Binary XML) pur Python ─────────────────────────
+    # Les fichiers .xml dans un APK sont compilés en binaire AXML, pas du XML texte.
+    # Ce décodeur lit le format AXML et reconstruit le XML lisible.
+    def decode_axml(data: bytes) -> str:
+        """
+        Décode un Android Binary XML (AXML) en XML texte lisible.
+        Format : magic 0x00080003, suivi de chunks STRING_POOL + XML_START_ELEMENT, etc.
+        Implémentation minimale mais suffisante pour NSC et AndroidManifest.
+        """
+        import struct
+
+        MAGIC       = 0x00080003
+        RES_STRING  = 0x001C0001
+        RES_START   = 0x00100102
+        RES_END     = 0x00100103
+        RES_ATTR    = 0x00100104  # non utilisé mais réservé
+
+        if len(data) < 8:
+            return ""
+        magic = struct.unpack_from("<I", data, 0)[0]
+        if magic != MAGIC:
+            # Pas du AXML → peut-être déjà du XML texte (APK debug non compilé)
+            text = data.decode("utf-8", errors="replace")
+            if "<" in text and ">" in text:
+                return text
+            return ""
+
+        # Lire la string pool
+        strings = []
+        offset = 8  # skip file header
+        while offset + 8 <= len(data):
+            chunk_type, chunk_size = struct.unpack_from("<II", data, offset)[:2]
+            if chunk_size == 0:
+                break
+            if chunk_type == RES_STRING:
+                try:
+                    str_count = struct.unpack_from("<I", data, offset + 8)[0]
+                    style_count = struct.unpack_from("<I", data, offset + 12)[0]
+                    flags = struct.unpack_from("<I", data, offset + 16)[0]
+                    str_start = struct.unpack_from("<I", data, offset + 20)[0]
+                    offsets_base = offset + 28
+                    pool_base = offset + 28 + str_count * 4 + style_count * 4
+
+                    is_utf8 = bool(flags & (1 << 8))
+                    for i in range(str_count):
+                        str_off = struct.unpack_from("<I", data, offsets_base + i * 4)[0]
+                        pos = pool_base + str_off
+                        try:
+                            if is_utf8:
+                                # UTF-8: premier octet = longueur UTF-16, deuxième = longueur UTF-8
+                                u16_len = data[pos] if data[pos] < 0x80 else ((data[pos] & 0x7F) << 8) | data[pos + 1]
+                                skip = 1 if data[pos] < 0x80 else 2
+                                pos += skip
+                                u8_len = data[pos] if data[pos] < 0x80 else ((data[pos] & 0x7F) << 8) | data[pos + 1]
+                                skip2 = 1 if data[pos] < 0x80 else 2
+                                pos += skip2
+                                strings.append(data[pos:pos + u8_len].decode("utf-8", errors="replace"))
+                            else:
+                                # UTF-16LE: premier word = longueur
+                                slen = struct.unpack_from("<H", data, pos)[0]
+                                pos += 2
+                                raw = data[pos:pos + slen * 2]
+                                strings.append(raw.decode("utf-16-le", errors="replace"))
+                        except Exception:
+                            strings.append("")
+                except Exception:
+                    pass
+            offset += chunk_size
+
+        # Lire les éléments XML
+        lines = ['<?xml version="1.0" encoding="utf-8"?>']
+        stack = []
+        offset = 8
+        ns_map = {}  # prefix → uri
+
+        ANDROID_NS = "http://schemas.android.com/apk/res/android"
+        ns_prefix = "android"
+
+        while offset + 8 <= len(data):
+            chunk_type, chunk_size = struct.unpack_from("<II", data, offset)[:2]
+            if chunk_size == 0:
+                break
+
+            if chunk_type == RES_START:
+                try:
+                    # ns(4) name(4) attr_start(2) attr_size(2) attr_count(2) id(2) cls(2) style(2)
+                    base = offset + 8
+                    ns_idx    = struct.unpack_from("<i", data, base)[0]
+                    name_idx  = struct.unpack_from("<i", data, base + 4)[0]
+                    attr_count = struct.unpack_from("<H", data, base + 10)[0]
+
+                    name = strings[name_idx] if 0 <= name_idx < len(strings) else "unknown"
+                    stack.append(name)
+
+                    attrs = []
+                    attr_base = base + 20
+                    for a in range(attr_count):
+                        ab = attr_base + a * 20
+                        a_ns   = struct.unpack_from("<i", data, ab)[0]
+                        a_name = struct.unpack_from("<i", data, ab + 4)[0]
+                        a_raw  = struct.unpack_from("<i", data, ab + 8)[0]
+                        a_type = struct.unpack_from("<B", data, ab + 15)[0]
+                        a_val  = struct.unpack_from("<i", data, ab + 16)[0]
+
+                        aname = strings[a_name] if 0 <= a_name < len(strings) else "attr"
+                        if a_ns >= 0 and a_ns < len(strings) and strings[a_ns] == ANDROID_NS:
+                            aname = f"android:{aname}"
+
+                        # Décoder la valeur selon le type
+                        if a_type == 0x03:  # TYPE_STRING
+                            aval = strings[a_raw] if 0 <= a_raw < len(strings) else ""
+                        elif a_type == 0x12:  # TYPE_BOOLEAN
+                            aval = "true" if a_val else "false"
+                        elif a_type == 0x10:  # TYPE_INT_DEC
+                            aval = str(a_val)
+                        elif a_type == 0x11:  # TYPE_INT_HEX
+                            aval = hex(a_val)
+                        elif a_type == 0x01:  # TYPE_REFERENCE
+                            aval = f"@{hex(a_val)}"
+                        else:
+                            aval = str(a_val) if a_val else ""
+
+                        attrs.append(f'{aname}="{aval}"')
+
+                    indent = "  " * (len(stack) - 1)
+                    attr_str = (" " + " ".join(attrs)) if attrs else ""
+                    lines.append(f"{indent}<{name}{attr_str}>")
+                except Exception:
+                    pass
+
+            elif chunk_type == RES_END:
+                try:
+                    name_idx = struct.unpack_from("<i", data, offset + 16)[0]
+                    name = strings[name_idx] if 0 <= name_idx < len(strings) else (stack[-1] if stack else "unknown")
+                    if stack:
+                        stack.pop()
+                    indent = "  " * len(stack)
+                    lines.append(f"{indent}</{name}>")
+                except Exception:
+                    pass
+
+            offset += max(chunk_size, 8)
+
+        result = "\n".join(lines)
+        return result if len(result) > 50 else ""
+
+    def _extract_nsc_via_apktool(apk_content: bytes, decompiler_obj) -> str:
+        """
+        Fallback : utilise apktool pour décoder le NSC en XML lisible.
+        apktool décode automatiquement les AXML en XML texte dans res/xml/.
+        """
+        if not decompiler_obj.apktool_available:
+            return ""
+        import tempfile, shutil, subprocess
+        temp_dir = tempfile.mkdtemp()
+        try:
+            apk_path = os.path.join(temp_dir, "app.apk")
+            out_dir  = os.path.join(temp_dir, "out")
+            with open(apk_path, "wb") as f:
+                f.write(apk_content)
+            subprocess.run(
+                [decompiler_obj._get_cmd("apktool"), "d", apk_path, "-o", out_dir, "-q", "-f"],
+                capture_output=True, timeout=60
+            )
+            # Chercher network_security_config.xml dans res/xml/
+            xml_dir = os.path.join(out_dir, "res", "xml")
+            if os.path.exists(xml_dir):
+                for fname in os.listdir(xml_dir):
+                    if "network_security" in fname.lower():
+                        fpath = os.path.join(xml_dir, fname)
+                        try:
+                            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                                return f.read()
+                        except Exception:
+                            pass
+            # Chercher aussi dans res/ directement
+            for root, _, files in os.walk(os.path.join(out_dir, "res")):
+                for fname in files:
+                    if "network_security" in fname.lower() and fname.endswith(".xml"):
+                        try:
+                            with open(os.path.join(root, fname), "r", encoding="utf-8", errors="replace") as f:
+                                return f.read()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return ""
+
+    # ── Extraction principale ──────────────────────────────────────────────────
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as apk:
             all_names = apk.namelist()
-            nsc_candidates = [n for n in all_names if "network_security_config" in n.lower()]
-            if nsc_candidates:
+
+            # Chercher le NSC (binaire AXML dans res/xml/)
+            nsc_candidates = [
+                n for n in all_names
+                if "network_security_config" in n.lower() and n.endswith(".xml")
+            ]
+            for nsc_name in nsc_candidates:
                 try:
-                    nsc_xml = apk.read(nsc_candidates[0]).decode("utf-8", errors="replace")
+                    raw_nsc = apk.read(nsc_name)
+                    # Tenter le décodage AXML
+                    decoded = decode_axml(raw_nsc)
+                    if decoded and "<" in decoded:
+                        nsc_xml = decoded
+                        break
+                    # Si c'est déjà du texte lisible (rare, APK debug)
+                    text_try = raw_nsc.decode("utf-8", errors="replace")
+                    if "<network-security-config" in text_try or "<base-config" in text_try:
+                        nsc_xml = text_try
+                        break
                 except Exception:
                     pass
-    except:
+
+            # Extraction des strings brutes (fichiers non-binaires)
+            for name in all_names:
+                if any(name.endswith(ext) for ext in [".json", ".properties", ".txt", ".js"]):
+                    try:
+                        raw_parts.append(apk.read(name).decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+                # Extraire aussi AndroidManifest.xml (AXML) pour avoir minSdkVersion etc.
+                if name == "AndroidManifest.xml":
+                    try:
+                        manifest_decoded = decode_axml(apk.read(name))
+                        if manifest_decoded:
+                            raw_parts.append(manifest_decoded)
+                    except Exception:
+                        pass
+
+    except Exception:
         pass
+
+    # ── Fallback apktool si AXML decoder n'a pas trouvé le NSC ───────────────
+    if not nsc_xml:
+        nsc_xml = _extract_nsc_via_apktool(content, decompiler)
+
+    results["raw_strings"] = "\n".join(raw_parts)[:50000]
+    results["nsc_xml"] = nsc_xml
     
     # 2️⃣ DÉCOMPILATION COMPLÈTE (apktool + jadx)
     results = {
@@ -149,45 +392,13 @@ async def analyze_apk(file: UploadFile = File(...)):
         "secrets": [],
         "decompilation_status": "pending",
         "nsc_xml": nsc_xml,
+        "raw_strings": "",
     }
     
     # Vérifier la disponibilité de jadx
     if not decompiler.jadx_available:
         results["decompilation_status"] = "jadx_not_available"
-        results["error"] = "jadx non installé. Installez avec: apt install jadx"
-        
-        # Fallback : utiliser l'ancienne méthode (zipfile)
-        try:
-            from analyzer import detect_android_security_patterns
-            with zipfile.ZipFile(io.BytesIO(content)) as apk:
-                all_names = apk.namelist()
-                raw_parts = []
-                smali_parts = []
-                for name in all_names:
-                    if any(name.endswith(ext) for ext in [".xml", ".json", ".js", ".properties", ".smali", ".txt"]):
-                        try:
-                            data = apk.read(name).decode("utf-8", errors="replace")
-                            raw_parts.append(data)
-                            if name.endswith(".smali"):
-                                smali_parts.append(data)
-                        except:
-                            pass
-                raw_text = "\n".join(raw_parts)
-                endpoints = extract_endpoints_from_text(raw_text)
-                for ep in endpoints:
-                    ep["env"] = classify_environment(ep["value"])
-                    ep["source"] = "zipfile_fallback"
-                results["endpoints"] = endpoints
-                results["anomalies"] = detect_anomalies(endpoints)
-                results["tls_checks"] = parse_nsc_xml(nsc_xml) if nsc_xml else []
-                # Analyse TLS statique sur le Smali ou raw (fallback jadx)
-                from analyzer import detect_android_security_patterns
-                analysis_code = "\n".join(smali_parts) if smali_parts else raw_text
-                results["java_security_checks"] = detect_android_security_patterns(analysis_code)
-                results["java_security_checks_source"] = "smali_fallback" if smali_parts else "raw_fallback"
-        except Exception as e:
-            results["error"] = str(e)
-        
+        results["error"] = "jadx non installé. Toutes les analyses de code doivent être réalisées par JADX. Installez jadx et réessayez."
         return results
     
     # 3️⃣ DÉCOMPILATION avec JADX (code Java source)
@@ -197,37 +408,6 @@ async def analyze_apk(file: UploadFile = File(...)):
         if java_result.get("error"):
             results["decompilation_status"] = "error"
             results["error"] = java_result["error"]
-            # Fallback to zipfile method if decompilation fails
-            try:
-                from analyzer import detect_android_security_patterns
-                with zipfile.ZipFile(io.BytesIO(content)) as apk:
-                    all_names = apk.namelist()
-                    raw_parts = []
-                    smali_parts = []
-                    for name in all_names:
-                        if any(name.endswith(ext) for ext in [".xml", ".json", ".js", ".properties", ".smali", ".txt"]):
-                            try:
-                                data = apk.read(name).decode("utf-8", errors="replace")
-                                raw_parts.append(data)
-                                if name.endswith(".smali"):
-                                    smali_parts.append(data)
-                            except:
-                                pass
-                    raw_text = "\n".join(raw_parts)
-                    endpoints = extract_endpoints_from_text(raw_text)
-                    for ep in endpoints:
-                        ep["env"] = classify_environment(ep["value"])
-                        ep["source"] = "zipfile_fallback_after_jadx_error"
-                    results["endpoints"] = endpoints
-                    results["anomalies"] = detect_anomalies(endpoints)
-                    results["tls_checks"] = parse_nsc_xml(nsc_xml) if nsc_xml else []
-                    # Analyse TLS statique sur le Smali (fallback jadx)
-                    if smali_parts:
-                        smali_code = "\n".join(smali_parts)
-                        results["java_security_checks"] = detect_android_security_patterns(smali_code)
-                        results["java_security_checks_source"] = "smali_fallback"
-            except Exception as fallback_e:
-                results["error"] += f" | Fallback aussi échoué: {str(fallback_e)}"
             return results
         
         results["decompilation_status"] = "success"
@@ -247,6 +427,13 @@ async def analyze_apk(file: UploadFile = File(...)):
             ep["env"] = classify_environment(ep["value"])
         
         results["endpoints"] = endpoints
+        endpoint_tls_analysis = analyze_endpoint_tls_per_endpoint(endpoints, nsc_xml)
+        results["endpoint_tls_analysis"] = endpoint_tls_analysis
+        results["endpoint_coverage"] = correlate_endpoints_with_nsc(endpoints, nsc_xml) if nsc_xml else []
+        tls_map = {item["endpoint"]: item for item in endpoint_tls_analysis}
+        for ep in results["endpoints"]:
+            if ep["value"] in tls_map:
+                ep["tls_info"] = tls_map[ep["value"]]
         
         # 6️⃣ DÉTECTION D'ANOMALIES
         results["anomalies"] = detect_anomalies(endpoints)
@@ -257,7 +444,8 @@ async def analyze_apk(file: UploadFile = File(...)):
         # 8️⃣ SECRETS DÉTECTÉS
         results["secrets"] = decompiler.extract_secrets_from_code(java_result.get("java_files", []))
         from analyzer import detect_android_security_patterns
-        results["java_security_checks"] = detect_android_security_patterns(java_code_full)
+        # Passer la liste des fichiers Java pour permettre la collecte d'évidence précise
+        results["java_security_checks"] = detect_android_security_patterns(java_result.get("java_files", []))
         
         # 9️⃣ STATISTIQUES
         results["stats"] = {
@@ -318,7 +506,7 @@ async def analyze_folder(files: List[UploadFile] = File(...)):
             except:
                 pass
             
-            # Analyse avec Jadx si disponible, sinon fallback zipfile
+            # Analyse avec Jadx uniquement ; aucune analyse de code ne doit utiliser zipfile
             apk_result = {
                 "filename": file.filename,
                 "status": "pending",
@@ -339,6 +527,14 @@ async def analyze_folder(files: List[UploadFile] = File(...)):
                         for ep in endpoints:
                             ep["env"] = classify_environment(ep["value"])
                         
+                        endpoint_tls_analysis = analyze_endpoint_tls_per_endpoint(endpoints, nsc_xml)
+                        apk_result["endpoint_tls_analysis"] = endpoint_tls_analysis
+                        apk_result["endpoint_coverage"] = correlate_endpoints_with_nsc(endpoints, nsc_xml) if nsc_xml else []
+                        tls_map = {item["endpoint"]: item for item in endpoint_tls_analysis}
+                        for ep in endpoints:
+                            if ep["value"] in tls_map:
+                                ep["tls_info"] = tls_map[ep["value"]]
+
                         apk_result["endpoints"] = endpoints
                         apk_result["anomalies"] = detect_anomalies(endpoints)
                         apk_result["secrets"] = decompiler.extract_secrets_from_code(java_result.get("java_files", []))
@@ -353,31 +549,8 @@ async def analyze_folder(files: List[UploadFile] = File(...)):
                     apk_result["status"] = "error"
                     apk_result["error"] = f"Erreur inattendue: {str(e)}"
             else:
-                # Fallback: zipfile
-                try:
-                    with zipfile.ZipFile(io.BytesIO(content)) as apk:
-                        all_names = apk.namelist()
-                        raw_parts = []
-                        for name in all_names:
-                            if any(name.endswith(ext) for ext in [".xml", ".json", ".js", ".properties"]):
-                                try:
-                                    data = apk.read(name).decode("utf-8", errors="replace")
-                                    raw_parts.append(data)
-                                except:
-                                    pass
-                        
-                        from analyzer import extract_endpoints_from_text
-                        raw_text = "\n".join(raw_parts)
-                        endpoints = extract_endpoints_from_text(raw_text)
-                        for ep in endpoints:
-                            ep["env"] = classify_environment(ep["value"])
-                        
-                        apk_result["endpoints"] = endpoints
-                        apk_result["anomalies"] = detect_anomalies(endpoints)
-                        apk_result["status"] = "success_fallback"
-                except Exception as e:
-                    apk_result["status"] = "error"
-                    apk_result["error"] = str(e)
+                apk_result["status"] = "error"
+                apk_result["error"] = "jadx non disponible. Toutes les analyses de code doivent être réalisées par JADX."
             
             # TLS checks
             apk_result["tls_checks"] = parse_nsc_xml(nsc_xml) if nsc_xml else []
@@ -544,11 +717,6 @@ async def decompile_full(file: UploadFile = File(...)):
             
             raw_text = "\n".join(raw_parts)
             results["raw_strings"] = raw_text[:50000]
-            endpoints = extract_endpoints_from_text(raw_text)
-            for ep in endpoints:
-                ep["env"] = classify_environment(ep["value"])
-            results["endpoints"] = endpoints
-            results["anomalies"] = detect_anomalies(endpoints)
             results["tls_checks"] = parse_nsc_xml(results["nsc_xml"]) if results["nsc_xml"] else []
             
     except zipfile.BadZipFile:
@@ -562,13 +730,28 @@ async def decompile_full(file: UploadFile = File(...)):
     java_result = decompiler.decompile_java(content)
     results["java"] = java_result
     
-    # 4️⃣ Secrets détectés + analyse sécurité TLS sur le code Java
+    # 4️⃣ Analyse du code Java décompilé
     if java_result.get("java_files"):
+        java_code_full = "".join([f.get("content", "") + "\n" for f in java_result.get("java_files", [])])
+        endpoints = extract_endpoints_from_java_code(java_code_full)
+        for ep in endpoints:
+            ep["env"] = classify_environment(ep["value"])
+
+        endpoint_tls_analysis = analyze_endpoint_tls_per_endpoint(endpoints, results.get("nsc_xml", ""))
+        results["endpoint_tls_analysis"] = endpoint_tls_analysis
+        results["endpoint_coverage"] = correlate_endpoints_with_nsc(endpoints, results.get("nsc_xml", ""))
+        tls_map = {item["endpoint"]: item for item in endpoint_tls_analysis}
+        for ep in endpoints:
+            if ep["value"] in tls_map:
+                ep["tls_info"] = tls_map[ep["value"]]
+
+        results["endpoints"] = endpoints
+        results["anomalies"] = detect_anomalies(endpoints)
         results["secrets"] = decompiler.extract_secrets_from_code(java_result["java_files"])
         from analyzer import detect_android_security_patterns
-        java_code_full = "\n".join(f.get("content", "") for f in java_result["java_files"])
-        results["java_security_checks"] = detect_android_security_patterns(java_code_full)
-    
+        # Utiliser la liste des fichiers Java pour des preuves ciblées
+        results["java_security_checks"] = detect_android_security_patterns(java_result.get("java_files", []))
+
     return results
 
 
