@@ -12,6 +12,7 @@ from typing import List
 from analyzer import (
     extract_endpoints_from_java_code,
     extract_endpoints_from_text,
+    extract_endpoints_from_har,
     parse_nsc_xml,
     detect_anomalies,
     classify_environment,
@@ -469,6 +470,85 @@ async def analyze_apk(file: UploadFile = File(...)):
         results["decompilation_status"] = "error"
         results["error"] = f"Erreur inattendue: {str(e)}"
         return results
+
+
+@app.post("/analyze/har")
+async def analyze_har(file: UploadFile = File(...)):
+    """
+    Analyse un fichier HAR (HTTP Archive) exporté depuis Chrome DevTools,
+    Firefox, Burp Suite ou mitmproxy.
+    Extrait les endpoints, détecte les anomalies TLS/HTTP et les headers manquants.
+    """
+    content = await file.read()
+    har_text = content.decode("utf-8", errors="replace")
+
+    # Extraction des endpoints via le parser HAR existant dans analyzer.py
+    endpoints = extract_endpoints_from_har(har_text)
+    for ep in endpoints:
+        ep["env"] = classify_environment(ep["value"])
+
+    # Anomalies sur les endpoints (cleartext, IPs privées, domaines suspects...)
+    anomalies = detect_anomalies(endpoints)
+
+    # Analyse approfondie des entrées HAR : cookies, headers de sécurité
+    try:
+        har = json.loads(har_text)
+        entries = har.get("log", {}).get("entries", [])
+        for entry in entries:
+            url = entry.get("request", {}).get("url", "")
+            resp = entry.get("response", {})
+
+            # Cookies sans Secure / HttpOnly
+            for cookie in resp.get("cookies", []):
+                name = cookie.get("name", "?")
+                if not cookie.get("secure", False):
+                    anomalies.append({
+                        "type": "cookie_no_secure",
+                        "severity": "high",
+                        "value": url,
+                        "detail": f"Cookie '{name}' sans flag Secure",
+                    })
+                if not cookie.get("httpOnly", False):
+                    anomalies.append({
+                        "type": "cookie_no_httponly",
+                        "severity": "medium",
+                        "value": url,
+                        "detail": f"Cookie '{name}' sans flag HttpOnly",
+                    })
+
+            # Headers de sécurité manquants
+            resp_headers = {h["name"].lower(): h["value"] for h in resp.get("headers", [])}
+            if url.startswith("https://") and "strict-transport-security" not in resp_headers:
+                anomalies.append({
+                    "type": "missing_hsts",
+                    "severity": "high",
+                    "value": url,
+                    "detail": f"Header HSTS absent sur {url}",
+                })
+            if "content-security-policy" not in resp_headers:
+                anomalies.append({
+                    "type": "missing_csp",
+                    "severity": "medium",
+                    "value": url,
+                    "detail": f"Header Content-Security-Policy absent sur {url}",
+                })
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    return {
+        "endpoints": endpoints,
+        "anomalies": anomalies,
+        "tls_checks": [],
+        "source": "har",
+        "stats": {
+            "total":     len(endpoints),
+            "prod":      sum(1 for e in endpoints if e["env"] == "prod"),
+            "test":      sum(1 for e in endpoints if e["env"] == "test"),
+            "cleartext": sum(1 for e in endpoints if e["value"].startswith("http://")),
+            "critical":  sum(1 for a in anomalies if a["severity"] == "critical"),
+            "high":      sum(1 for a in anomalies if a["severity"] == "high"),
+        },
+    }
 
 
 @app.post("/analyze/folder")
