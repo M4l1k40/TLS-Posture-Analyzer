@@ -2,12 +2,6 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { analyzeText, analyzeAPK, analyzeHAR, decompileFull, checkDecompileTools, streamAI, checkHealth } from './api.js'
 import DecompilerViewer from './components/DecompilerViewer'
 
-// ── Conversion des résultats backend java_security_checks → format checklist ──
-//
-// Le backend retourne un tableau de checks avec { label, found, detail, severity, vulnerable }
-// On mappe vers le format attendu par ChecklistItem { key, label, detail, severity, icon,
-// analyzed, ok, found, verdict }
-//
 const BACKEND_CHECK_MAP = {
   'TrustManager custom':        { key: 'trust_manager',    icon: 'certificate',  severity: 'critical' },
   'HostnameVerifier custom':    { key: 'hostname_verifier', icon: 'server',       severity: 'critical' },
@@ -19,7 +13,6 @@ const BACKEND_CHECK_MAP = {
 }
 
 function buildChecklistFromBackend(backendChecks, results) {
-  // Checks basés sur le code Java (depuis backend)
   const javaChecks = backendChecks.map(bc => {
     const meta = BACKEND_CHECK_MAP[bc.label] || {
       key: bc.label.toLowerCase().replace(/\s+/g, '_'),
@@ -40,7 +33,6 @@ function buildChecklistFromBackend(backendChecks, results) {
     }
   })
 
-  // Checks NSC/Cleartext (toujours depuis le XML, pas du Java)
   const hasNsc = !!results?.nsc_xml
   const rawStrings = results?.raw_strings || ''
   const cleartextAllowed = !!(
@@ -49,7 +41,6 @@ function buildChecklistFromBackend(backendChecks, results) {
   )
   const debugOverride = !!(rawStrings.match(/<debug-overrides>[\s\S]{0,200}<certificates\s+src\s*=\s*["']user["']/))
 
-  // Si cleartext ou debug_override déjà couverts par backendChecks, ne pas dupliquer
   const hasCleartext = javaChecks.some(c => c.key === 'cleartext')
   if (!hasCleartext) {
     javaChecks.push({
@@ -91,21 +82,12 @@ function buildChecklistFromBackend(backendChecks, results) {
   return { checks, hasAnalysis, hasCode, critical, high, passed }
 }
 
-// ── Analyse dynamique de la checklist Android ─────────────────────────────────
-//
-// Priorité 1 : java_security_checks retourné par le backend (analyse complète
-//              sur le code Java non tronqué via /decompile/full)
-// Priorité 2 : analyse locale JS sur les fichiers java_files (fallback, tronqués
-//              à 3000 chars par fichier — moins fiable)
-//
 function analyzeAndroidChecklist(results) {
-  // ── Priorité 1 : résultats backend (code Java complet, non tronqué) ─────────
   const backendChecks = results?.java_security_checks
   if (backendChecks && backendChecks.length > 0) {
     return buildChecklistFromBackend(backendChecks, results)
   }
 
-  // ── Priorité 2 : analyse locale JS (fallback — fichiers tronqués à 3000 chars) ─
   const javaFiles = results?.java?.java_files || []
   const smaliFiles = results?.smali?.smali_files || []
   const rawStrings = results?.raw_strings || ''
@@ -117,7 +99,6 @@ function analyzeAndroidChecklist(results) {
 
   const hasCode = javaCode.trim().length > 50
 
-  // Cherche un pattern dans le code, retourne l'extrait trouvé ou null
   function search(patterns) {
     for (const p of patterns) {
       const m = javaCode.match(p)
@@ -126,7 +107,6 @@ function analyzeAndroidChecklist(results) {
     return null
   }
 
-  // ── 1. TrustManager custom vide (checkServerTrusted vide = vulnérable) ──
   const tmEmpty = search([
     /checkServerTrusted\s*\([^)]*\)\s*\{[\s]*\}/,
     /checkServerTrusted\s*\([^)]*\)\s*throws[^{]*\{[\s]*\}/,
@@ -138,7 +118,6 @@ function analyzeAndroidChecklist(results) {
   const tmVuln = !!tmEmpty && !tmFilled
   const tmPresent = !!tmEmpty || !!tmFilled
 
-  // ── 2. HostnameVerifier dangereux ──
   const hnvVuln = search([
     /AllowAllHostnameVerifier/,
     /ALLOW_ALL_HOSTNAME_VERIFIER/,
@@ -147,14 +126,12 @@ function analyzeAndroidChecklist(results) {
   ])
   const hnvPresent = search([/HostnameVerifier/, /hostnameVerifier/])
 
-  // ── 3. WebView onReceivedSslError ──
   const wvProceed = search([
     /onReceivedSslError[\s\S]{0,200}handler\.proceed\s*\(\s*\)/,
     /handler\.proceed\(\)/,
   ])
   const wvPresent = search([/onReceivedSslError/, /SslErrorHandler/])
 
-  // ── 4. OkHttp CertificatePinner ──
   const pinFound = search([
     /CertificatePinner/,
     /certificatePinner/,
@@ -163,7 +140,6 @@ function analyzeAndroidChecklist(results) {
   ])
   const sha256Found = search([/sha256\/[A-Za-z0-9+/=]{20,}/, /pin\s*=\s*["']sha/])
 
-  // ── 5. Version TLS — SSLv3/TLS 1.0 désactivés ──
   const tlsWeak = search([
     /SSLv3/,
     /TLSv1(?!\.2|\.3)/,
@@ -178,7 +154,6 @@ function analyzeAndroidChecklist(results) {
     /SSLContext\.getInstance\s*\(\s*["']TLS/,
   ])
 
-  // ── 6. Cipher suite moderne (OkHttp ConnectionSpec) ──
   const modernTLS = search([
     /ConnectionSpec\.MODERN_TLS/,
     /MODERN_TLS/,
@@ -190,20 +165,17 @@ function analyzeAndroidChecklist(results) {
     /SSL_RSA/,
   ])
 
-  // ── 7. Cleartext traffic (NSC ou Manifest) ──
   const cleartextAllowed = search([
     /cleartextTrafficPermitted\s*=\s*["']true["']/,
     /android:usesCleartextTraffic\s*=\s*["']true["']/,
     /NetworkSecurityPolicy\.getInstance\(\)\.isCleartextTrafficPermitted/,
   ])
 
-  // ── 8. Debug overrides (certificats user en prod) ──
   const debugOverride = search([
     /<debug-overrides>[\s\S]{0,200}<certificates\s+src\s*=\s*["']user["']/,
     /certificates.*src.*user/,
   ])
 
-  // Construire les résultats
   const checks = [
     {
       key: 'trust_manager',
@@ -476,7 +448,7 @@ function DropZone({ onFile }) {
         textAlign: 'center',
         cursor: 'pointer',
         transition: 'all 0.2s',
-        background: drag ? '#0c2340' : 'transparent',
+        background: drag ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent',
       }}
     >
       <input ref={inputRef} type="file" accept=".apk" style={{ display: 'none' }} onChange={e => handle(e.target.files[0])} />
@@ -487,12 +459,9 @@ function DropZone({ onFile }) {
   )
 }
 
-// ── ChecklistItem — composant dynamique avec expand/collapse ─────────────────
-
 function ChecklistItem({ check: c, isLast }) {
   const [open, setOpen] = useState(false)
 
-  // Icône d'état
   let stateIcon, stateColor
   if (c.ok === true)  { stateIcon = 'circle-check';    stateColor = 'var(--green)' }
   if (c.ok === false) { stateIcon = 'circle-x';        stateColor = 'var(--red)' }
@@ -510,12 +479,12 @@ function ChecklistItem({ check: c, isLast }) {
             <i className={`ti ti-${c.icon}`} style={{ fontSize: 12, color: 'var(--text3)' }} />
             {c.label}
             {c.analyzed && c.ok !== null && (
-              <span style={{ fontSize: 9, color: 'var(--accent)', background: '#0c2340', padding: '1px 5px', borderRadius: 10, fontWeight: 500 }}>
+              <span style={{ fontSize: 9, color: 'var(--accent)', background: 'color-mix(in srgb, var(--accent) 12%, transparent)', padding: '1px 5px', borderRadius: 10, fontWeight: 500 }}>
                 ANALYSÉ
               </span>
             )}
           </div>
-          <div style={{ fontSize: 12, color: c.ok === false ? '#f85149' : c.ok === true ? 'var(--green)' : 'var(--text2)', marginBottom: c.ok !== null ? 2 : 0 }}>
+          <div style={{ fontSize: 12, color: c.ok === false ? 'var(--red)' : c.ok === true ? 'var(--green)' : 'var(--text2)', marginBottom: c.ok !== null ? 2 : 0 }}>
             {c.verdict || c.detail}
           </div>
           {c.ok === null && (
@@ -530,7 +499,6 @@ function ChecklistItem({ check: c, isLast }) {
         </div>
       </div>
 
-      {/* Extrait de code trouvé */}
       {open && c.found && (
         <div style={{
           margin: '0 0 10px 26px',
@@ -542,7 +510,7 @@ function ChecklistItem({ check: c, isLast }) {
           <div style={{ fontSize: 10, color: 'var(--text3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
             Extrait détecté dans le code
           </div>
-          <code style={{ fontSize: 11, color: c.ok === false ? '#f85149' : 'var(--orange)', wordBreak: 'break-all', display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+          <code style={{ fontSize: 11, color: c.ok === false ? 'var(--red)' : 'var(--orange)', wordBreak: 'break-all', display: 'block', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
             {c.found}
           </code>
         </div>
@@ -598,6 +566,18 @@ const DEMO_NSC = `<?xml version="1.0" encoding="utf-8"?>
 export default function App() {
   const [tab, setTab] = useState('input')
   const [health, setHealth] = useState(null)
+
+  // ── Theme toggle ──────────────────────────────────────────────────────────
+  const [theme, setTheme] = useState(() => {
+    return localStorage.getItem('tls-theme') || 'dark'
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('tls-theme', theme)
+  }, [theme])
+
+  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
 
   // Inputs
   const [apkText, setApkText]     = useState('')
@@ -660,7 +640,6 @@ export default function App() {
     setLoading(true)
     try {
       const data = await analyzeHAR(file)
-      // Fusionner avec les résultats existants si APK déjà analysé
       if (results) {
         const merged = {
           ...results,
@@ -700,7 +679,6 @@ export default function App() {
     setLoading(true)
     try {
       const data = await decompileFull(apkFile)
-      // Fusionner les résultats de décompilation avec les résultats statiques
       setResults({
         ...results,
         ...data,
@@ -843,7 +821,7 @@ Génère des recommandations concrètes et priorisées :
           <span style={{ fontSize: 11, color: 'var(--text3)', background: 'var(--bg3)', padding: '2px 8px', borderRadius: 20, border: '1px solid var(--border)' }}>
             Network Security Audit
           </span>
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
             {health && (
               <span style={{ fontSize: 11, color: health.status === 'ok' ? 'var(--green)' : 'var(--red)', display: 'flex', alignItems: 'center', gap: 5 }}>
                 <StatusDot ok={health.status === 'ok'} />
@@ -851,6 +829,16 @@ Génère des recommandations concrètes et priorisées :
                 {health.api_key_set === false && ' · ⚠ API key manquante'}
               </span>
             )}
+
+            {/* ── Theme toggle ── */}
+            <button
+              onClick={toggleTheme}
+              title={theme === 'dark' ? 'Passer en mode clair' : 'Passer en mode sombre'}
+              style={{ padding: '5px 10px', fontSize: 12, gap: 5 }}
+            >
+              <i className={`ti ti-${theme === 'dark' ? 'sun' : 'moon'}`} style={{ fontSize: 14 }} />
+              {theme === 'dark' ? 'Clair' : 'Sombre'}
+            </button>
           </div>
         </div>
       </header>
@@ -891,7 +879,6 @@ Génère des recommandations concrètes et priorisées :
           {/* ── ENTRÉES ── */}
           {tab === 'input' && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
-              {/* Left column */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <Card>
                   <SectionTitle icon="package-import">Analyser un APK</SectionTitle>
@@ -958,7 +945,6 @@ Génère des recommandations concrètes et priorisées :
                 </Card>
               </div>
 
-              {/* Right column */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <Card>
                   <SectionTitle icon="file-code">Strings APK (texte brut)</SectionTitle>
@@ -1013,8 +999,8 @@ Génère des recommandations concrètes et priorisées :
                 <>
                   <div style={{ display: 'flex', gap: 10 }}>
                     <Metric val={s.total}     label="Total"     />
-                    <Metric val={s.prod}      label="Production"  color="#79c0ff" />
-                    <Metric val={s.test}      label="Test/Staging" color="#e3b341" />
+                    <Metric val={s.prod}      label="Production"  color="var(--accent)" />
+                    <Metric val={s.test}      label="Test/Staging" color="var(--orange)" />
                     <Metric val={s.cleartext} label="HTTP clair"   color="var(--red)" />
                   </div>
 
@@ -1028,7 +1014,7 @@ Génère des recommandations concrètes et priorisées :
                       />
                       {['all', 'prod', 'test', 'unknown'].map(f => (
                         <button key={f} onClick={() => setEnvFilter(f)}
-                          style={{ background: envFilter === f ? 'var(--accent)' : 'var(--bg3)', color: envFilter === f ? '#0d1117' : 'var(--text2)', padding: '4px 10px', fontSize: 11, fontWeight: 600 }}>
+                          style={{ background: envFilter === f ? 'var(--accent)' : 'var(--bg3)', color: envFilter === f ? '#fff' : 'var(--text2)', padding: '4px 10px', fontSize: 11, fontWeight: 600 }}>
                           {f.toUpperCase()}
                         </button>
                       ))}
@@ -1049,7 +1035,7 @@ Génère des recommandations concrètes et priorisées :
                           {ep.nsc_coverage && (
                             <span style={{
                               fontSize: 10,
-                              color: ep.nsc_coverage.status === 'covered' ? '#7ee787' : '#ffb86b',
+                              color: ep.nsc_coverage.status === 'covered' ? 'var(--green)' : 'var(--orange)',
                               fontWeight: 600,
                               flexShrink: 0,
                             }}>
@@ -1057,7 +1043,7 @@ Génère des recommandations concrètes et priorisées :
                             </span>
                           )}
                           {ep.tls_info && (
-                            <span style={{ fontSize: 10, color: ep.tls_info.risk === 'critical' ? 'var(--red)' : ep.tls_info.risk === 'high' ? '#ffb86b' : '#8be9fd', flexShrink: 0 }}>
+                            <span style={{ fontSize: 10, color: ep.tls_info.risk === 'critical' ? 'var(--red)' : ep.tls_info.risk === 'high' ? 'var(--orange)' : 'var(--accent)', flexShrink: 0 }}>
                               {ep.tls_info.risk}
                             </span>
                           )}
@@ -1098,7 +1084,6 @@ Génère des recommandations concrètes et priorisées :
                     ))}
                   </Card>
 
-                  {/* ── CHECKLIST DYNAMIQUE ── */}
                   {(() => {
                     const cl = analyzeAndroidChecklist(results)
                     return (
@@ -1114,20 +1099,13 @@ Génère des recommandations concrètes et priorisées :
                         </div>
                         <div style={{ fontSize: 12, color: 'var(--text2)', background: 'var(--bg3)', borderRadius: 'var(--radius)', padding: '10px 14px', marginBottom: 10, display: 'flex', gap: 8 }}>
                           <i className="ti ti-info-circle" />
-                          Les anomalies de code sont détaillées ci-dessous. Ne vous fiez pas uniquement à un score en haut : lisez chaque contrôle pour voir le contexte exact.
+                          Les anomalies de code sont détaillées ci-dessous.
                         </div>
 
-                        {!cl.hasAnalysis && (
-                          <div style={{ fontSize: 12, color: 'var(--text2)', background: 'var(--bg3)', borderRadius: 'var(--radius)', padding: '10px 14px', marginBottom: 10, display: 'flex', gap: 8 }}>
-                            <i className="ti ti-info-circle" />
-                            Checklist statique — uploadez un APK et lancez la décompilation complète pour une analyse dynamique du code Java.
-                          </div>
-                        )}
-
                         {cl.hasCode && (
-                          <div style={{ fontSize: 11, color: 'var(--green)', background: '#0d2310', borderRadius: 'var(--radius)', padding: '6px 12px', marginBottom: 12, display: 'flex', gap: 6, alignItems: 'center' }}>
+                          <div style={{ fontSize: 11, color: 'var(--green)', background: 'color-mix(in srgb, var(--green) 10%, transparent)', borderRadius: 'var(--radius)', padding: '6px 12px', marginBottom: 12, display: 'flex', gap: 6, alignItems: 'center' }}>
                             <i className="ti ti-circle-check" />
-                            Analyse dynamique — code Java décompilé détecté, résultats basés sur le code réel de l'APK
+                            Analyse dynamique — code Java décompilé détecté
                           </div>
                         )}
 
@@ -1151,9 +1129,9 @@ Génère des recommandations concrètes et priorisées :
                 <>
                   <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                     <Metric val={combinedCritical} label="Critiques"  color="var(--red)" />
-                    <Metric val={combinedHigh} label="Élevées" color="var(--orange)" />
-                    <Metric val={combinedMedium} label="Moyennes" color="var(--accent)" />
-                    <Metric val={anomalyCount} label="Total" />
+                    <Metric val={combinedHigh}     label="Élevées"    color="var(--orange)" />
+                    <Metric val={combinedMedium}   label="Moyennes"   color="var(--accent)" />
+                    <Metric val={anomalyCount}     label="Total" />
                   </div>
 
                   <Card>
@@ -1187,11 +1165,10 @@ Génère des recommandations concrètes et priorisées :
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {!apkFile ? (
                 <p style={{ color: 'var(--text2)', fontSize: 13 }}>
-                  📦 Charge d'abord un APK dans l'onglet <strong>Entrées</strong> pour accéder à la décompilation complète.
+                  📦 Charge d'abord un APK dans l'onglet <strong>Entrées</strong>.
                 </p>
               ) : (
                 <>
-                  {/* Tools Status */}
                   <Card style={{ background: 'var(--bg3)', padding: '1rem' }}>
                     <SectionTitle icon="info-circle">Statut des outils de décompilation</SectionTitle>
                     <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
@@ -1200,164 +1177,98 @@ Génère des recommandations concrètes et priorisées :
                     <div style={{ fontSize: 12, display: 'flex', gap: 20 }}>
                       <div>
                         <strong>Smali (apktool)</strong>
-                        <div style={{ color: 'var(--text2)', marginTop: 4 }}>
-                          <code style={{ fontSize: 11 }}>apt install apktool</code>
-                        </div>
+                        <div style={{ color: 'var(--text2)', marginTop: 4 }}><code style={{ fontSize: 11 }}>apt install apktool</code></div>
                       </div>
                       <div>
                         <strong>Java (jadx)</strong>
-                        <div style={{ color: 'var(--text2)', marginTop: 4 }}>
-                          <code style={{ fontSize: 11 }}>apt install jadx</code>
-                        </div>
+                        <div style={{ color: 'var(--text2)', marginTop: 4 }}><code style={{ fontSize: 11 }}>apt install jadx</code></div>
                       </div>
                     </div>
                   </Card>
 
-                  {/* Decompilation Options */}
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
                     <Card>
                       <SectionTitle icon="code">Code Java complet</SectionTitle>
-                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
-                        Décompile en code source Java lisible
-                      </p>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>Décompile en code source Java lisible</p>
                       <button onClick={() => results?.java ? setTab('decompile') : alert('Lancer la décompilation d\'abord')}>
-                        <i className="ti ti-player-play" />
-                        Voir le code Java
+                        <i className="ti ti-player-play" />Voir le code Java
                       </button>
                     </Card>
-
                     <Card>
                       <SectionTitle icon="code-plus">Assembleur Smali</SectionTitle>
-                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
-                        Code assembleur optimisé (bytecode Dalvik)
-                      </p>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>Code assembleur optimisé (bytecode Dalvik)</p>
                       <button onClick={() => results?.smali ? setTab('decompile') : alert('Lancer la décompilation d\'abord')}>
-                        <i className="ti ti-player-play" />
-                        Voir le Smali
+                        <i className="ti ti-player-play" />Voir le Smali
                       </button>
                     </Card>
-
                     <Card>
                       <SectionTitle icon="rocket">Décompilation COMPLÈTE</SectionTitle>
-                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>
-                        Statique + Smali + Java + secrets
-                      </p>
-                      <button onClick={runFullDecompilation} disabled={loading} style={{ background: loading ? '#2d2d2d' : 'var(--accent)' }}>
+                      <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 12 }}>Statique + Smali + Java + secrets</p>
+                      <button onClick={runFullDecompilation} disabled={loading} style={{ background: loading ? 'var(--bg3)' : 'var(--accent)', color: loading ? 'var(--text2)' : '#fff', borderColor: 'var(--accent)' }}>
                         <i className={`ti ti-${loading ? 'loader' : 'rocket'}`} style={loading ? { animation: 'spin 1s linear infinite' } : {}} />
                         {loading ? 'Décompilation…' : 'Décompiler'}
                       </button>
                     </Card>
                   </div>
 
-                  {/* Results */}
                   {results?.java && (
                     <Card>
                       <SectionTitle icon="file-code" count={results.java.java_files?.length || 0}>Fichiers Java décompilés</SectionTitle>
-                      {/* Badge mode de décompilation */}
                       {results.decompile_mode && results.decompile_mode !== 'none' && (
                         <div style={{
                           display: 'inline-flex', alignItems: 'center', gap: 6,
                           padding: '4px 10px', borderRadius: 20, marginBottom: 10, fontSize: 11, fontWeight: 600,
-                          background: results.decompile_mode === 'standard' ? '#1a3d1a'
-                            : results.decompile_mode === 'permissive' ? '#3d2e00'
-                            : results.decompile_mode === 'partial' ? '#3d1a00'
-                            : '#3d1a1a',
-                          color: results.decompile_mode === 'standard' ? 'var(--green)'
-                            : results.decompile_mode === 'permissive' ? '#e3b341'
-                            : results.decompile_mode === 'partial' ? '#ff9960'
-                            : 'var(--red)',
-                          border: `1px solid ${results.decompile_mode === 'standard' ? 'var(--green)' : results.decompile_mode === 'permissive' ? '#e3b341' : results.decompile_mode === 'partial' ? '#ff9960' : 'var(--red)'}`,
+                          background: results.decompile_mode === 'standard' ? 'color-mix(in srgb, var(--green) 15%, transparent)' : 'color-mix(in srgb, var(--orange) 15%, transparent)',
+                          color: results.decompile_mode === 'standard' ? 'var(--green)' : 'var(--orange)',
+                          border: `1px solid ${results.decompile_mode === 'standard' ? 'var(--green)' : 'var(--orange)'}`,
                         }}>
                           {results.decompile_mode === 'standard' && '✓ Mode standard'}
                           {results.decompile_mode === 'permissive' && '⚠ Mode permissif (APK obfusqué)'}
                           {results.decompile_mode === 'partial' && '⚡ Mode partiel (APK protégé)'}
                           {results.decompile_mode === 'failed' && '✗ Décompilation impossible'}
-                          {!['standard','permissive','partial','failed'].includes(results.decompile_mode) && results.decompile_mode}
                         </div>
                       )}
-                      {/* Warning mode permissif / partiel */}
                       {results.warning && (
-                        <div style={{
-                          background: '#2d2200', border: '1px solid #e3b341',
-                          borderRadius: 'var(--radius)', padding: '8px 12px',
-                          fontSize: 11, color: '#e3b341', marginBottom: 10
-                        }}>
+                        <div style={{ background: 'color-mix(in srgb, var(--orange) 10%, transparent)', border: '1px solid var(--orange)', borderRadius: 'var(--radius)', padding: '8px 12px', fontSize: 11, color: 'var(--orange)', marginBottom: 10 }}>
                           ⚠️ {results.warning}
                         </div>
                       )}
                       {results.java?.java_files?.length > 0 ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                          <DecompilerViewer javaFiles={results.java.java_files} anomalies={results.anomalies || []} />
-                        </div>
+                        <DecompilerViewer javaFiles={results.java.java_files} anomalies={results.anomalies || []} />
                       ) : (
                         <div style={{ color: 'var(--text2)', fontSize: 12 }}>
-                          {results.java?.available === false ? (
-                            <>
-                              ❌ <strong>jadx non détecté</strong> — vérifiez que jadx est dans le PATH.<br />
-                              <span style={{ fontSize: 11, color: 'var(--text3)' }}>
-                                Windows : jadx doit être accessible comme <code>jadx.bat</code> dans le PATH.<br />
-                                Linux/macOS : <code>apt install jadx</code> ou <code>brew install jadx</code>
-                              </span>
-                            </>
-                          ) : results.java?.error || results.error ? (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                              <div>⚠️ <strong>Erreur jadx :</strong> {results.java?.error || results.error}</div>
-                              <div style={{ fontSize: 11, color: 'var(--text3)', background: 'var(--bg3)', padding: '8px 10px', borderRadius: 'var(--radius)' }}>
-                                💡 <strong>Analyse de repli activée</strong> — les endpoints, anomalies et checks TLS ont été extraits
-                                depuis les strings brutes et fichiers Smali de l'APK.
-                                {results.java_security_checks_source === 'smali_fallback' && ' (source : Smali)'}
-                                {results.java_security_checks_source === 'raw_fallback' && ' (source : strings brutes)'}
-                              </div>
-                            </div>
-                          ) : (
-                            <>⚠️ Décompilation terminée mais aucun fichier Java produit.</>
-                          )}
+                          {results.java?.error || results.error
+                            ? <>{results.java?.error || results.error}</>
+                            : <>⚠️ Décompilation terminée mais aucun fichier Java produit.</>
+                          }
                         </div>
                       )}
                     </Card>
                   )}
 
-                  {/* Secrets Detected */}
                   {results?.secrets && results.secrets.length > 0 && (
                     <Card>
                       <SectionTitle icon="alert-triangle" count={results.secrets.length}>🔓 Secrets détectés dans le code</SectionTitle>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                         {results.secrets.map((secret, i) => (
-                          <div key={i} style={{
-                            background: '#3d1a1a', border: '1px solid #f85149',
-                            borderRadius: 'var(--radius)', padding: '10px 12px', fontSize: 11
-                          }}>
-                            <div style={{ color: '#f85149', fontWeight: 600, marginBottom: 4 }}>
-                              🔑 {secret.type.toUpperCase()}
-                            </div>
-                            <div style={{ fontFamily: 'var(--mono)', wordBreak: 'break-all', color: 'var(--text)', marginBottom: 4 }}>
-                              {secret.value.slice(0, 100)}
-                            </div>
-                            <div style={{ color: 'var(--text3)', fontSize: 10 }}>
-                              @ {secret.file}
-                            </div>
+                          <div key={i} style={{ background: 'color-mix(in srgb, var(--red) 10%, transparent)', border: '1px solid var(--red)', borderRadius: 'var(--radius)', padding: '10px 12px', fontSize: 11 }}>
+                            <div style={{ color: 'var(--red)', fontWeight: 600, marginBottom: 4 }}>🔑 {secret.type.toUpperCase()}</div>
+                            <div style={{ fontFamily: 'var(--mono)', wordBreak: 'break-all', color: 'var(--text)', marginBottom: 4 }}>{secret.value.slice(0, 100)}</div>
+                            <div style={{ color: 'var(--text3)', fontSize: 10 }}>@ {secret.file}</div>
                           </div>
                         ))}
                       </div>
                     </Card>
                   )}
 
-                  {/* Smali Files */}
                   {results?.smali?.smali_files && results.smali.smali_files.length > 0 && (
                     <Card>
                       <SectionTitle icon="assembly" count={results.smali.smali_files.length}>Fichiers Smali</SectionTitle>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                         {results.smali.smali_files.slice(0, 10).map((file, i) => (
-                          <div key={i} style={{
-                            background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
-                            padding: '8px 10px', fontSize: 10
-                          }}>
-                            <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', marginBottom: 2 }}>
-                              {file.name}
-                            </div>
-                            <div style={{ color: 'var(--text2)', fontSize: 9 }}>
-                              📍 {file.path}
-                            </div>
+                          <div key={i} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '8px 10px', fontSize: 10 }}>
+                            <div style={{ fontFamily: 'var(--mono)', color: 'var(--accent)', marginBottom: 2 }}>{file.name}</div>
+                            <div style={{ color: 'var(--text3)', fontSize: 9 }}>📍 {file.path}</div>
                           </div>
                         ))}
                       </div>
@@ -1375,17 +1286,16 @@ Génère des recommandations concrètes et priorisées :
                 <p style={{ color: 'var(--text2)', fontSize: 13 }}>Lance d'abord l'analyse statique dans l'onglet <strong>Entrées</strong>.</p>
               ) : (
                 <>
-                  {/* Stats bar */}
                   <Card style={{ background: 'var(--bg3)', padding: '10px 16px' }}>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, fontSize: 12, color: 'var(--text2)', alignItems: 'center' }}>
                       <span><i className="ti ti-world" style={{ marginRight: 4 }} />{s.total} endpoints</span>
-                      <span style={{ color: '#79c0ff' }}>{s.prod} prod</span>
+                      <span style={{ color: 'var(--accent)' }}>{s.prod} prod</span>
                       <span>·</span>
-                      <span style={{ color: '#e3b341' }}>{s.test} test</span>
+                      <span style={{ color: 'var(--orange)' }}>{s.test} test</span>
                       <span>·</span>
                       <span style={{ color: 'var(--red)' }}>{s.critical || 0} critiques</span>
                       <span>·</span>
-                      <span>{results.anomalies.length} anomalies</span>
+                      <span>{(results.anomalies || []).length} anomalies</span>
                       {nscXml && <><span>·</span><span style={{ color: 'var(--green)' }}>NSC analysé</span></>}
                     </div>
                   </Card>

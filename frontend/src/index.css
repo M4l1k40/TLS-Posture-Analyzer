@@ -1,5 +1,6 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* ── Dark theme (default) ── */
 :root {
   --bg:       #0d1117;
   --bg2:      #161b22;
@@ -19,6 +20,22 @@
   --radius-lg: 12px;
 }
 
+/* ── Light theme ── */
+:root[data-theme="light"] {
+  --bg:       #ffffff;
+  --bg2:      #f6f8fa;
+  --bg3:      #eaeef2;
+  --border:   #d0d7de;
+  --text:     #1f2328;
+  --text2:    #656d76;
+  --text3:    #9198a1;
+  --accent:   #0969da;
+  --green:    #1a7f37;
+  --red:      #d1242f;
+  --orange:   #9a6700;
+  --purple:   #8250df;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -26,6 +43,7 @@ body {
   font-size: 14px;
   line-height: 1.6;
   min-height: 100vh;
+  transition: background 0.2s, color 0.2s;
 }
 
 button {
@@ -42,15 +60,15 @@ button {
   align-items: center;
   gap: 6px;
 }
-button:hover { background: #2d333b; border-color: #8b949e; }
+button:hover { background: var(--bg2); border-color: var(--text2); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary {
   background: var(--accent);
-  color: #0d1117;
+  color: #ffffff;
   border-color: var(--accent);
   font-weight: 600;
 }
-button.primary:hover { background: #79c0ff; }
+button.primary:hover { opacity: 0.88; }
 
 input, textarea, select {
   font-family: var(--mono);
@@ -61,7 +79,7 @@ input, textarea, select {
   border-radius: var(--radius);
   padding: 8px 12px;
   width: 100%;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, background 0.2s;
 }
 input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 textarea { resize: vertical; min-height: 90px; line-height: 1.5; }
