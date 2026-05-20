@@ -1,0 +1,43 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Node.js ───────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# ── Données runtime ───────────────────────────────────────────
+backend/uploads/
+backend/temp/
+logs/
+*.log
+
+# ── Secrets ───────────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Git ───────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── APK de test (ne pas embarquer dans l'image) ───────────────
+*.apk
+*.aab

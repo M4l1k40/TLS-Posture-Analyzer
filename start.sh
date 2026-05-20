@@ -1,91 +1,152 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
+# ============================================================
+#  TLS Posture Analyzer — Start Script (Linux / macOS)
+# ============================================================
+
 set -e
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
 
-echo -e "${BOLD}${CYAN}"
+echo -e "${CYAN}"
 echo "  ████████╗██╗     ███████╗    ██████╗  ██████╗ ███████╗████████╗██╗   ██╗██████╗ ███████╗"
-echo "  ╚══██╔══╝██║     ██╔════╝    ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██║   ██║██╔══██╗██╔════╝"
+echo "     ██╔══╝██║     ██╔════╝    ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██║   ██║██╔══██╗██╔════╝"
 echo "     ██║   ██║     ███████╗    ██████╔╝██║   ██║███████╗   ██║   ██║   ██║██████╔╝█████╗  "
 echo "     ██║   ██║     ╚════██║    ██╔═══╝ ██║   ██║╚════██║   ██║   ██║   ██║██╔══██╗██╔══╝  "
 echo "     ██║   ███████╗███████║    ██║     ╚██████╔╝███████║   ██║   ╚██████╔╝██║  ██║███████╗"
 echo "     ╚═╝   ╚══════╝╚══════╝    ╚═╝      ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝"
 echo -e "${NC}"
-echo -e "${BOLD}  Network / TLS Posture Analyzer — Android Security Audit Tool${NC}"
+echo -e "${CYAN}         Android Network Security Audit Tool${NC}"
 echo ""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_DIR="$SCRIPT_DIR/backend"
-FRONTEND_DIR="$SCRIPT_DIR/frontend"
+# ── Détection OS ──────────────────────────────────────────────
+OS="$(uname -s)"
+case "$OS" in
+  Darwin*) PLATFORM="macOS" ;;
+  Linux*)  PLATFORM="Linux" ;;
+  *)       PLATFORM="Unknown" ;;
+esac
+echo -e "${GREEN}[+] Plateforme détectée : $PLATFORM${NC}"
 
-# ── Check API key ─────────────────────────────────────────────────────────────
-if [ -f "$BACKEND_DIR/.env" ]; then
-  export $(grep -v '^#' "$BACKEND_DIR/.env" | xargs)
-fi
-
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-  echo -e "${YELLOW}⚠  ANTHROPIC_API_KEY non configurée.${NC}"
-  echo -e "   L'analyse IA sera désactivée. Pour l'activer :"
-  echo -e "   ${CYAN}cp backend/.env.example backend/.env && nano backend/.env${NC}"
-  echo ""
-fi
-
-# ── Check Python ──────────────────────────────────────────────────────────────
+# ── Vérification Python ────────────────────────────────────────
 if ! command -v python3 &>/dev/null; then
-  echo -e "${RED}✗ Python 3 requis (non trouvé).${NC}"; exit 1
+  echo -e "${RED}[!] Python 3 introuvable. Installe-le depuis https://python.org${NC}"
+  exit 1
 fi
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo -e "${GREEN}[+] Python $PYTHON_VERSION détecté${NC}"
 
-# ── Check Node ────────────────────────────────────────────────────────────────
+# ── Vérification Node.js ───────────────────────────────────────
 if ! command -v node &>/dev/null; then
-  echo -e "${RED}✗ Node.js requis (non trouvé). Installe depuis https://nodejs.org${NC}"; exit 1
+  echo -e "${RED}[!] Node.js introuvable. Installe-le depuis https://nodejs.org${NC}"
+  exit 1
 fi
+NODE_VERSION=$(node --version)
+echo -e "${GREEN}[+] Node.js $NODE_VERSION détecté${NC}"
 
-# ── Install Python deps ───────────────────────────────────────────────────────
-echo -e "${BLUE}▶ Installation des dépendances Python…${NC}"
-cd "$BACKEND_DIR"
-if [ ! -d "venv" ]; then
-  python3 -m venv venv
-fi
-source venv/bin/activate
-pip install -q -r requirements.txt
-echo -e "${GREEN}✓ Backend prêt${NC}"
-
-# ── Install Node deps ─────────────────────────────────────────────────────────
-echo -e "${BLUE}▶ Installation des dépendances Node…${NC}"
-cd "$FRONTEND_DIR"
-if [ ! -d "node_modules" ]; then
-  npm install --silent
-fi
-echo -e "${GREEN}✓ Frontend prêt${NC}"
+# ── Vérification outils optionnels ────────────────────────────
 echo ""
+echo -e "${CYAN}[*] Vérification des outils d'analyse...${NC}"
 
-# ── Start backend ─────────────────────────────────────────────────────────────
-echo -e "${BOLD}🚀 Démarrage du backend (port 8000)…${NC}"
-cd "$BACKEND_DIR"
-source venv/bin/activate
-ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+if command -v jadx &>/dev/null; then
+  echo -e "${GREEN}[+] jadx : disponible${NC}"
+else
+  echo -e "${YELLOW}[~] jadx : non trouvé — la décompilation Java sera limitée${NC}"
+  echo -e "${YELLOW}    → Linux : sudo apt install jadx${NC}"
+  echo -e "${YELLOW}    → macOS : brew install jadx${NC}"
+fi
+
+if command -v apktool &>/dev/null; then
+  echo -e "${GREEN}[+] apktool : disponible${NC}"
+else
+  echo -e "${YELLOW}[~] apktool : non trouvé — le Smali sera indisponible${NC}"
+fi
+
+# ── Backend — environnement virtuel ───────────────────────────
+echo ""
+echo -e "${CYAN}[*] Configuration du backend...${NC}"
+cd backend
+
+if [ ! -d ".venv" ]; then
+  echo -e "${CYAN}[*] Création de l'environnement virtuel...${NC}"
+  python3 -m venv .venv
+fi
+
+echo -e "${CYAN}[*] Activation du venv et installation des dépendances...${NC}"
+source .venv/bin/activate
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
+echo -e "${GREEN}[+] Backend prêt${NC}"
+
+# ── Fichier .env ───────────────────────────────────────────────
+if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+  cp .env.example .env
+  echo -e "${YELLOW}[~] Fichier .env créé depuis .env.example — configure ta clé Groq si nécessaire${NC}"
+fi
+
+# ── Lancement backend en arrière-plan ─────────────────────────
+echo -e "${CYAN}[*] Démarrage du backend FastAPI sur le port 8000...${NC}"
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload &> ../logs/backend.log &
 BACKEND_PID=$!
+echo -e "${GREEN}[+] Backend démarré (PID: $BACKEND_PID)${NC}"
 
-sleep 2
+# ── Attente que le backend réponde ────────────────────────────
+echo -e "${CYAN}[*] Attente du backend...${NC}"
+MAX_WAIT=30
+COUNT=0
+until curl -s http://localhost:8000/health &>/dev/null; do
+  sleep 1
+  COUNT=$((COUNT + 1))
+  if [ $COUNT -ge $MAX_WAIT ]; then
+    echo -e "${RED}[!] Le backend n'a pas démarré après ${MAX_WAIT}s. Vérifie logs/backend.log${NC}"
+    exit 1
+  fi
+done
+echo -e "${GREEN}[+] Backend opérationnel ✓${NC}"
 
-# ── Start frontend ────────────────────────────────────────────────────────────
-echo -e "${BOLD}🚀 Démarrage du frontend (port 5173)…${NC}"
-cd "$FRONTEND_DIR"
-npm run dev &
+# ── Frontend ───────────────────────────────────────────────────
+echo ""
+echo -e "${CYAN}[*] Configuration du frontend...${NC}"
+cd ../frontend
+
+if [ ! -d "node_modules" ]; then
+  echo -e "${CYAN}[*] Installation des packages npm...${NC}"
+  npm install -q
+fi
+
+echo -e "${CYAN}[*] Démarrage du frontend Vite sur le port 5173...${NC}"
+npm run dev &> ../logs/frontend.log &
 FRONTEND_PID=$!
 
+# ── Résumé ─────────────────────────────────────────────────────
+cd ..
+mkdir -p logs
 sleep 2
 echo ""
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  ✓ App disponible → http://localhost:5173${NC}"
-echo -e "${GREEN}${BOLD}  ✓ API docs       → http://localhost:8000/docs${NC}"
-echo -e "${GREEN}${BOLD}════════════════════════════════════════${NC}"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  ✓ TLS Posture Analyzer est lancé !${NC}"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
+echo -e "  Frontend  →  ${CYAN}http://localhost:5173${NC}"
+echo -e "  Backend   →  ${CYAN}http://localhost:8000${NC}"
+echo -e "  API Docs  →  ${CYAN}http://localhost:8000/docs${NC}"
+echo -e "  Logs      →  ${CYAN}./logs/${NC}"
 echo ""
-echo -e "  ${YELLOW}Ctrl+C pour arrêter${NC}"
+echo -e "${YELLOW}  Ctrl+C pour arrêter les deux serveurs${NC}"
+echo ""
 
-# ── Cleanup on exit ───────────────────────────────────────────────────────────
-trap "echo ''; echo 'Arrêt…'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit 0" INT TERM
+# ── Trap pour cleanup propre ───────────────────────────────────
+cleanup() {
+  echo ""
+  echo -e "${CYAN}[*] Arrêt des serveurs...${NC}"
+  kill $BACKEND_PID $FRONTEND_PID 2>/dev/null
+  echo -e "${GREEN}[+] Serveurs arrêtés. À bientôt !${NC}"
+  exit 0
+}
+trap cleanup SIGINT SIGTERM
 
+# Garder le script actif
 wait

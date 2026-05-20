@@ -1,0 +1,47 @@
+# ============================================================
+#  TLS Posture Analyzer — Docker Compose
+# ============================================================
+
+services:
+
+  tls-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tls-posture-analyzer
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"       # Backend FastAPI + frontend statique
+
+    environment:
+      # Optionnel : colle ta clé Groq ici ou utilise un .env
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - MAX_DECOMPILE_FILES=${MAX_DECOMPILE_FILES:-200}
+      - JADX_TIMEOUT=${JADX_TIMEOUT:-180}
+
+    volumes:
+      # Persistance des uploads entre redémarrages
+      - uploads_data:/app/uploads
+      # Montage du .env local si présent
+      - ./backend/.env:/app/backend/.env:ro
+
+    # Limites mémoire (la décompilation est gourmande)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  uploads_data:
+    driver: local

@@ -1,83 +1,167 @@
 @echo off
-chcp 65001 > nul
+setlocal EnableDelayedExpansion
+chcp 65001 >nul 2>&1
+
+:: ============================================================
+::  TLS Posture Analyzer — Start Script (Windows)
+:: ============================================================
+
 title TLS Posture Analyzer
 
 echo.
-echo  ████████╗██╗     ███████╗    ██████╗  ██████╗ ███████╗████████╗██╗   ██╗██████╗ ███████╗
-echo  ╚══██╔══╝██║     ██╔════╝    ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██║   ██║██╔══██╗██╔════╝
-echo     ██║   ██║     ███████╗    ██████╔╝██║   ██║███████╗   ██║   ██║   ██║██████╔╝█████╗
-echo     ██║   ██║     ╚════██║    ██╔═══╝ ██║   ██║╚════██║   ██║   ██║   ██║██╔══██╗██╔══╝
-echo     ██║   ███████╗███████║    ██║     ╚██████╔╝███████║   ██║   ╚██████╔╝██║  ██║███████╗
-echo     ╚═╝   ╚══════╝╚══════╝    ╚═╝      ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝
+echo   ████████╗██╗     ███████╗    ██████╗  ██████╗ ███████╗████████╗██╗   ██╗██████╗ ███████╗
+echo      ██╔══╝██║     ██╔════╝    ██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝██║   ██║██╔══██╗██╔════╝
+echo      ██║   ██║     ███████╗    ██████╔╝██║   ██║███████╗   ██║   ██║   ██║██████╔╝█████╗
+echo      ██║   ██║     ╚════██║    ██╔═══╝ ██║   ██║╚════██║   ██║   ██║   ██║██╔══██╗██╔══╝
+echo      ██║   ███████╗███████║    ██║     ╚██████╔╝███████║   ██║   ╚██████╔╝██║  ██║███████╗
+echo      ╚═╝   ╚══════╝╚══════╝    ╚═╝      ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝
 echo.
-echo  Network / TLS Posture Analyzer — Android Security Audit Tool
+echo          Android Network Security Audit Tool
 echo.
 
-set SCRIPT_DIR=%~dp0
-set BACKEND_DIR=%SCRIPT_DIR%backend
-set FRONTEND_DIR=%SCRIPT_DIR%frontend
+:: ── Création dossier logs ─────────────────────────────────────
+if not exist logs mkdir logs
 
-:: Load .env if present
-if exist "%BACKEND_DIR%\.env" (
-  for /f "tokens=1,2 delims==" %%a in (%BACKEND_DIR%\.env) do (
-    if not "%%a"=="" set %%a=%%b
-  )
-)
-
-if "%ANTHROPIC_API_KEY%"=="" (
-  echo [WARN] ANTHROPIC_API_KEY non configuree.
-  echo        Copiez backend\.env.example vers backend\.env et remplissez la cle.
-  echo.
-)
-
-:: Check Python
+:: ── Vérification Python ───────────────────────────────────────
+echo [*] Vérification de Python...
 python --version >nul 2>&1
 if errorlevel 1 (
-  echo [ERROR] Python 3 requis. Installe depuis https://python.org
-  pause & exit /b 1
+    python3 --version >nul 2>&1
+    if errorlevel 1 (
+        echo [!] Python introuvable. Installe-le depuis https://python.org
+        pause
+        exit /b 1
+    )
+    set PYTHON_CMD=python3
+) else (
+    set PYTHON_CMD=python
 )
+for /f "tokens=*" %%i in ('!PYTHON_CMD! --version') do echo [+] %%i detecte
 
-:: Check Node
+:: ── Vérification Node.js ──────────────────────────────────────
+echo [*] Vérification de Node.js...
 node --version >nul 2>&1
 if errorlevel 1 (
-  echo [ERROR] Node.js requis. Installe depuis https://nodejs.org
-  pause & exit /b 1
+    echo [!] Node.js introuvable. Installe-le depuis https://nodejs.org
+    pause
+    exit /b 1
+)
+for /f "tokens=*" %%i in ('node --version') do echo [+] Node.js %%i detecte
+
+:: ── Vérification outils optionnels ───────────────────────────
+echo.
+echo [*] Vérification des outils d'analyse...
+
+jadx --version >nul 2>&1
+if errorlevel 1 (
+    echo [~] jadx : non trouve ^(decompilation Java limitee^)
+    echo     ^-^> Installe depuis https://github.com/skylot/jadx/releases
+) else (
+    echo [+] jadx : disponible
 )
 
-:: Install Python deps
-echo [*] Installation des dependances Python...
-cd "%BACKEND_DIR%"
-if not exist "venv" python -m venv venv
-call venv\Scripts\activate.bat
-pip install -q -r requirements.txt
-echo [OK] Backend pret
+apktool --version >nul 2>&1
+if errorlevel 1 (
+    echo [~] apktool : non trouve ^(Smali indisponible^)
+) else (
+    echo [+] apktool : disponible
+)
 
-:: Install Node deps
-echo [*] Installation des dependances Node...
-cd "%FRONTEND_DIR%"
-if not exist "node_modules" npm install --silent
-echo [OK] Frontend pret
+:: ── Backend — environnement virtuel ──────────────────────────
 echo.
+echo [*] Configuration du backend...
+cd backend
 
-:: Start backend
-echo [*] Demarrage backend (port 8000)...
-cd "%BACKEND_DIR%"
-start "TLS-Backend" cmd /k "venv\Scripts\activate.bat && set ANTHROPIC_API_KEY=%ANTHROPIC_API_KEY% && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+if not exist .venv (
+    echo [*] Creation de l'environnement virtuel...
+    !PYTHON_CMD! -m venv .venv
+    if errorlevel 1 (
+        echo [!] Echec creation venv
+        pause
+        exit /b 1
+    )
+)
 
-timeout /t 3 /nobreak > nul
+echo [*] Activation du venv et installation des dependances...
+call .venv\Scripts\activate.bat
 
-:: Start frontend
-echo [*] Demarrage frontend (port 5173)...
-cd "%FRONTEND_DIR%"
-start "TLS-Frontend" cmd /k "npm run dev"
+python -m pip install --upgrade pip -q
+pip install -r requirements.txt -q
+if errorlevel 1 (
+    echo [!] Echec installation des dependances backend
+    pause
+    exit /b 1
+)
+echo [+] Backend pret
 
-timeout /t 3 /nobreak > nul
+:: ── Fichier .env ──────────────────────────────────────────────
+if not exist .env (
+    if exist .env.example (
+        copy .env.example .env >nul
+        echo [~] Fichier .env cree depuis .env.example
+        echo     Configure ta cle Groq si necessaire : GROQ_API_KEY=gsk_...
+    )
+)
 
+:: ── Lancement backend ─────────────────────────────────────────
+echo [*] Demarrage du backend FastAPI sur le port 8000...
+start "TLS-Backend" /min cmd /c "call .venv\Scripts\activate.bat && uvicorn main:app --host 0.0.0.0 --port 8000 --reload > ..\logs\backend.log 2>&1"
+
+:: ── Attente backend ───────────────────────────────────────────
+echo [*] Attente du backend...
+set /a COUNT=0
+:WAIT_BACKEND
+timeout /t 1 /nobreak >nul
+curl -s http://localhost:8000/health >nul 2>&1
+if not errorlevel 1 goto BACKEND_OK
+set /a COUNT=COUNT+1
+if !COUNT! GEQ 30 (
+    echo [!] Le backend n'a pas demarre apres 30s
+    echo     Consulte logs\backend.log pour le detail
+    pause
+    exit /b 1
+)
+goto WAIT_BACKEND
+
+:BACKEND_OK
+echo [+] Backend operationnel !
+
+:: ── Frontend ──────────────────────────────────────────────────
 echo.
-echo ==========================================
-echo   OK  App disponible : http://localhost:5173
-echo   OK  API docs       : http://localhost:8000/docs
-echo ==========================================
+echo [*] Configuration du frontend...
+cd ..\frontend
+
+if not exist node_modules (
+    echo [*] Installation des packages npm...
+    npm install
+    if errorlevel 1 (
+        echo [!] Echec installation npm
+        pause
+        exit /b 1
+    )
+)
+
+echo [*] Demarrage du frontend Vite sur le port 5173...
+start "TLS-Frontend" /min cmd /c "npm run dev > ..\logs\frontend.log 2>&1"
+
+:: ── Ouvrir le navigateur ──────────────────────────────────────
+cd ..
+timeout /t 3 /nobreak >nul
+echo [*] Ouverture du navigateur...
+start http://localhost:5173
+
+:: ── Résumé ────────────────────────────────────────────────────
 echo.
-echo Ferme les fenetres "TLS-Backend" et "TLS-Frontend" pour arreter.
+echo ============================================
+echo   TLS Posture Analyzer est lance !
+echo ============================================
+echo   Frontend  -^>  http://localhost:5173
+echo   Backend   -^>  http://localhost:8000
+echo   API Docs  -^>  http://localhost:8000/docs
+echo   Logs      -^>  .\logs\
+echo.
+echo   Ferme les fenetres "TLS-Backend" et
+echo   "TLS-Frontend" pour arreter les serveurs.
+echo ============================================
+echo.
 pause
