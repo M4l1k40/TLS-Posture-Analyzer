@@ -48,3 +48,8 @@ dist/
 
 # Build
 *.log
+
+*.rar
+*.zip
+*.apk
+*.aab
