@@ -317,9 +317,8 @@ curl http://localhost:8000/config/api-key-status
 # {"configured": false} → set key via /config/api-key or .env
 ```
 **video demonstration**
-https://github.com/user-attachments/assets/17f63d43-38ff-4fd6-9298-2ae5f3a5ad0b
 
----
+https://github.com/user-attachments/assets/17f63d43-38ff-4fd6-9298-2ae5f3a5ad0b
 
 ## License
 
