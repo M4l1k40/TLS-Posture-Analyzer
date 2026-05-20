@@ -23,7 +23,7 @@ TLS Posture Analyzer is an open-source security audit tool designed for Android 
 
 ## Features
 
-### 🔍 Input Sources
+### Input Sources
 | Source | Description |
 |--------|-------------|
 | APK file | Full decompilation via jadx (Java source) + apktool (Smali) |
@@ -32,7 +32,7 @@ TLS Posture Analyzer is an open-source security audit tool designed for Android 
 | NSC XML | Manual paste of `network_security_config.xml` |
 | Raw strings | Output of `strings classes.dex` or any text dump |
 
-### 🛡️ Security Checks
+### Security Checks
 - **TrustManager custom** — detects empty `checkServerTrusted()` (TLS bypass)
 - **HostnameVerifier** — `AllowAllHostnameVerifier`, `verify() → true`
 - **WebView SSL errors** — `handler.proceed()` in `onReceivedSslError`
@@ -45,14 +45,14 @@ TLS Posture Analyzer is an open-source security audit tool designed for Android 
 - **Certificate Transparency** — lifecycle and pin expiry warnings
 - **NSC domain rules** — `base-config`, `domain-config`, `pin-set` deep parsing
 
-### 📊 Endpoint Analysis
+### Endpoint Analysis
 - URL / domain / bare IP extraction with noise filtering (no XML namespaces, no Android SDK artifacts)
 - Environment classification: **prod**, **test**, **unknown**
 - NSC coverage correlation per endpoint
 - TLS risk level per endpoint (based on NSC + code patterns)
 - Anomaly detection: cleartext HTTP, private IPs, ngrok/tunneling domains, mixed protocols
 
-### 🤖 AI Report (Groq)
+### AI Report (Groq)
 - Risk summary with score /10
 - Top 3 critical findings
 - Prioritized hardening recommendations (P0→P3)
@@ -316,6 +316,8 @@ uvicorn main:app --port 8001
 curl http://localhost:8000/config/api-key-status
 # {"configured": false} → set key via /config/api-key or .env
 ```
+**video demonstration**
+https://github.com/user-attachments/assets/17f63d43-38ff-4fd6-9298-2ae5f3a5ad0b
 
 ---
 
@@ -325,6 +327,3 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-## Author
-
-**M4l1k40** — 2026
